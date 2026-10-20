@@ -80,6 +80,79 @@ constexpr int kThreads = 256;
 constexpr int kChunkCells = 256;   // attention split-K chunk
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
 
+// --- NVFP4 (ModelOpt) lm_head: host-side dequant + requant to Q8_0 for the MMVQ path -------------------------
+static uint16_t f32_to_f16_bits(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t ex = (int32_t) ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t man = x & 0x7FFFFF;
+    if (((x >> 23) & 0xFF) == 0xFF) return (uint16_t) (sign | 0x7C00 | (man ? 1 : 0));
+    if (ex >= 31) return (uint16_t) (sign | 0x7C00);
+    if (ex <= 0) {
+        if (ex < -10) return (uint16_t) sign;
+        man |= 0x800000;
+        int sh = 14 - ex;
+        uint32_t rem = man & (((uint32_t) 1 << sh) - 1);
+        man >>= sh;
+        if (rem > ((uint32_t) 1 << (sh - 1)) || (rem == ((uint32_t) 1 << (sh - 1)) && (man & 1))) man++;
+        return (uint16_t) (sign | man);
+    }
+    uint32_t rem = man & 0x1FFF;
+    man >>= 13;
+    if (rem > 0x1000 || (rem == 0x1000 && (man & 1))) man++;
+    if (man == 0x400) {
+        man = 0;
+        ex++;
+    }
+    return (uint16_t) (sign | ((uint32_t) ex << 10) | man);
+}
+
+static void nvfp4_row_to_f32(const uint8_t* row, int n, float* x, float ws) {
+    static const float KV[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const int nb = n / 64;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* bl = row + b * 36;
+        float s[4];
+        for (int i = 0; i < 4; ++i) {
+            uint8_t u = bl[i];
+            float v;
+            if (u == 0 || u == 0x7F) v = 0.0f;
+            else {
+                int e = (u >> 3) & 0xF, m = u & 7;
+                v = (e == 0) ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
+            }
+            s[i] = v * 0.5f * ws;
+        }
+        float* out = x + b * 64;
+        for (int sb = 0; sb < 4; ++sb) {
+            const uint8_t* q = bl + 4 + sb * 8;
+            for (int j = 0; j < 8; ++j) {
+                out[sb * 16 + j] = KV[q[j] & 0xF] * s[sb];
+                out[sb * 16 + 8 + j] = KV[q[j] >> 4] * s[sb];
+            }
+        }
+    }
+}
+
+static void quant_f32_to_q8_0_row(const float* x, int n, uint8_t* dst) {
+    for (int b = 0; b < n / 32; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xb[i]));
+        float d = amax / 127.0f;
+        uint16_t d16 = f32_to_f16_bits(d);
+        std::memcpy(dst + b * 34, &d16, 2);
+        float id = d > 0 ? 1.0f / d : 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            int q = (int) std::lround(xb[i] * id);
+            q = std::max(-127, std::min(127, q));
+            dst[b * 34 + 2 + i] = (uint8_t) (int8_t) q;
+        }
+    }
+}
+// -------------------------------------------------------------------------------------------------------------
+
 // ------------------------------------------------------------------------------------------------ small kernels
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
@@ -853,6 +926,7 @@ struct Layer {
     // the GGUF's expert tensors (the mapped file stays open): place_experts builds the blobs from them
     const uint8_t *src_g = nullptr, *src_u = nullptr, *src_d = nullptr;
     size_t src_gsz = 0, src_dsz = 0;
+    const float *s_gate = nullptr, *s_up = nullptr, *s_down = nullptr;   // NVFP4 per-expert weight_scale_2 (host, from .scale)
     uint8_t* hblobs = nullptr;  // hybrid mode: every expert's blob in host memory, `stride` apart
     int n_slots = 0;            // hybrid mode: the experts resident in VRAM
 };
@@ -1086,6 +1160,20 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         y.src_d = gm.shard(sd).tensor_data(*td);
         y.src_gsz = gsz;
         y.src_dsz = dsz;
+        if (y.L.tail_off) {
+            // NVFP4 (ModelOpt): the per-expert weight_scale_2 lives in the F32 `.scale` tensors beside the weights
+            size_t ssg = 0, ssu = 0, ssd = 0;
+            const strata::TensorInfo* tsg = find(L(l, "ffn_gate_exps.scale"), ssg);
+            const strata::TensorInfo* tsu = find(L(l, "ffn_up_exps.scale"), ssu);
+            const strata::TensorInfo* tsd = find(L(l, "ffn_down_exps.scale"), ssd);
+            if (tsg->type != 0 || tsu->type != 0 || tsd->type != 0) {
+                err = L(l, "the NVFP4 experts' .scale tensors are not F32");
+                return false;
+            }
+            y.s_gate = (const float*) gm.shard(ssg).tensor_data(*tsg);
+            y.s_up   = (const float*) gm.shard(ssu).tensor_data(*tsu);
+            y.s_down = (const float*) gm.shard(ssd).tensor_data(*tsd);
+        }
     }
     if (m.has_mtp) {
         const int64_t l = g.n_layers;
@@ -1095,7 +1183,39 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
     m.out_norm = f32("output_norm.weight");
-    m.head = mat("output.weight");
+    {
+        size_t s = 0;
+        const strata::TensorInfo* t = find("output.weight", s);
+        if ((int) t->type == 40) {
+            // the ModelOpt lm_head is NVFP4: dequant + requant to Q8_0 on the host once (~1 s),
+            // then the MMVQ path takes it like any other head
+            const int64_t n_in = (int64_t) t->shape[0], n_out = (int64_t) t->shape[1];
+            float ws = 1.0f;
+            size_t ss = 0;
+            if (const strata::TensorInfo* ts = gm.find("output.scale", &ss))
+                ws = *((const float*) gm.shard(ss).tensor_data(*ts));
+            const uint8_t* src = (const uint8_t*) gm.shard(s).tensor_data(*t);
+            const size_t rb_in = (size_t) (n_in / 64) * 36, rb_out = (size_t) (n_in / 32) * 34;
+            std::vector<uint8_t> q8((size_t) n_out * rb_out);
+            std::vector<float> x((size_t) n_in);
+            for (int64_t r = 0; r < n_out; ++r) {
+                nvfp4_row_to_f32(src + (size_t) r * rb_in, (int) n_in, x.data(), ws);
+                quant_f32_to_q8_0_row(x.data(), (int) n_in, q8.data() + (size_t) r * rb_out);
+            }
+            uint8_t* d = nullptr;
+            CK(cudaMalloc(&d, q8.size()));
+            CK(cudaMemcpy(d, q8.data(), q8.size(), cudaMemcpyHostToDevice));
+            m.head.d = d;
+            m.head.type = 8;
+            m.head.n_in = (int) n_in;
+            m.head.n_out = (int) n_out;
+            bytes += q8.size();
+            std::fprintf(stderr, "strata-q36: output.weight NVFP4 -> Q8_0 on the host (ws %.6g, %.1f MiB)\n", ws,
+                         (double) q8.size() / (1 << 20));
+        } else {
+            m.head = mat("output.weight");
+        }
+    }
     {
         size_t s = 0;
         const strata::TensorInfo* t = find("token_embd.weight", s);
@@ -1119,6 +1239,14 @@ void expert_blob(const Layer& L, int64_t e, uint8_t* dst) {
     std::memcpy(dst, L.src_g + (size_t) e * L.src_gsz, L.src_gsz);
     std::memcpy(dst + L.L.up_off, L.src_u + (size_t) e * L.src_gsz, L.src_gsz);
     std::memcpy(dst + L.L.down_off, L.src_d + (size_t) e * L.src_dsz, L.src_dsz);
+    if (L.L.tail_off) {
+        // NVFP4: {s_gate, s_up, s_down, 0} after down - the per-expert weight_scale_2 the kernels multiply by
+        float* tail = (float*) (dst + L.L.tail_off);
+        tail[0] = L.s_gate ? L.s_gate[e] : 1.0f;
+        tail[1] = L.s_up   ? L.s_up[e]   : 1.0f;
+        tail[2] = L.s_down ? L.s_down[e] : 1.0f;
+        tail[3] = 0.0f;
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ the engine

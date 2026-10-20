@@ -1,3 +1,22 @@
+> [!NOTE]
+> **Fork：为 qwen35moe 家族加入 NVFP4（ModelOpt）原生支持** —— 在 16GB RTX 5060 Ti 上原生运行
+> [Ornith-1.5-35B-A3B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4)
+> （W4A8 量化，256 选 8 专家，10 全注意力层 + 30 GDN/SSM 层 + 1 MTP 块）：
+> **prefill ~1300 tok/s，decode ~50 tok/s**（混合专家池：63/256 专家驻留显存 + 17.7 GiB 锁页内存）。
+>
+> 相对上游（engine 0.1.45.3）的改动：
+> - `include/strata/core/family_layout.hpp` —— layout 校验放行 NVFP4 的 `.scale` 张量，以及 Q8_0 重打包后
+>   以 2D 展平形式 `[d0, d1*d2]` 存储的路由专家张量（数据线性布局与 3D 完全等价；引擎按几何参数而非张量
+>   shape 计算专家布局）。
+> - `src/qwen35/q36_engine.cu` —— ① 路由专家：加载时从 F32 `ffn_{gate,up,down}_exps.scale` 张量读取
+>   per-expert `weight_scale_2`，填入专家 blob 尾包 `{s_gate, s_up, s_down, 0}`；② ModelOpt 的 lm_head
+>   （`output.weight`，同为 NVFP4）在加载时由 host 一次性 dequant + 重量化为 Q8_0（约 1 秒，515 MiB），
+>   完全复用现有 MMVQ 路径。
+>
+> 模型转换链：HF NVFP4 safetensors → `convert_hf_to_gguf.py`（NVFP4 repack）→ 共享专家 / dense / MTP BF16
+> 张量重铸为 Q8_0，120 个路由专家保留 NVFP4 + `.scale`（20.4 GB GGUF）。基线测试报告见
+> `docs/strata-nvfp4-baseline.md`。以下为上游 README。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

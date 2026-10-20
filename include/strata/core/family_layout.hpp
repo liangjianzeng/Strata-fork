@@ -251,6 +251,12 @@ inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g
         }
         bool same = t->shape.size() == shape.size();
         for (size_t i = 0; same && i < shape.size(); ++i) same = t->shape[i] == (uint64_t) shape[i];
+        // a Q8_0-recast of a 3-D routed-experts tensor may be stored flattened as 2-D [d0, d1*d2]:
+        // the same linear layout, and the qwen35 engine sizes the experts from geometry, not from this shape
+        if (!same && name.size() >= 12 && name.compare(name.size() - 12, 12, "_exps.weight") == 0 &&
+            t->shape.size() == 2 && shape.size() == 3 && t->shape[0] == (uint64_t) shape[0] &&
+            t->shape[1] == (uint64_t) (shape[1] * shape[2]))
+            same = true;
         if (!same) {
             std::string got, want;
             for (uint64_t d : t->shape) got += (got.empty() ? "" : ", ") + std::to_string(d);
@@ -272,11 +278,15 @@ inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g
             if (!check("blk." + std::to_string(l) + "." + w.name, w.shape)) return false;
     if (layout_table_complete(g)) {
         for (size_t s = 0; s < m.size(); ++s)
-            for (const strata::TensorInfo& t : m.shard(s).tensors())
-                if (!named.count(t.name)) {
+            for (const strata::TensorInfo& t : m.shard(s).tensors()) {
+                // `.scale` = NVFP4 (ModelOpt) per-expert weight_scale_2 beside the experts: the qwen35 engine
+                // reads it for its blob tails, so a model file may carry it even though the table names no scales
+                const bool is_scale = t.name.size() >= 6 && t.name.compare(t.name.size() - 6, 6, ".scale") == 0;
+                if (!named.count(t.name) && !is_scale) {
                     err = t.name + " is not in the " + std::string(strata::model_family_title(g.family)) + " layout";
                     return false;
                 }
+            }
     }
     if (checked) *checked = n;
     return true;
