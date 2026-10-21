@@ -2,9 +2,10 @@
 > **Fork：为 qwen35moe 家族加入 NVFP4（ModelOpt）原生支持** —— 在 16GB RTX 5060 Ti 上原生运行
 > [Ornith-1.5-35B-A3B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4)
 > （W4A8 量化，256 选 8 专家，10 全注意力层 + 30 GDN/SSM 层 + 1 MTP 块）：
-> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / ~48 tok/s @256K ctx（q4_0 KV + 48 expert slots）**
-> （混合专家池：**全部 17.67 GiB 路由专家常驻锁页 host 内存**，每层只让 7–63 / 256 个进显存
+> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / ~60 tok/s @双路 200K ctx（q4_0 KV + 48 expert slots）**
+> （混合专家池：**全部 17.67 GiB 路由专家常驻 host 内存**，每层只让 48 / 256 个进显存
 > —— **NVFP4 不要求专家全部驻留显存**；ctx 越大留给专家池的 VRAM 越少，decode 越慢）。
+> **并发**：`--batch 2` 同时解码两路会话，每路各一份完整 KV（单路 256K，或双路 200K×2）。
 >
 > 相对上游（engine 0.1.45.3）的改动：
 > - `include/strata/core/family_layout.hpp` —— layout 校验放行 NVFP4 的 `.scale` 张量，以及 Q8_0 重打包后
@@ -18,7 +19,16 @@
 >   fp16 scale）与 k8v4 存储，写入侧量化、decode/prefill 读取侧反量化，与 QSA 层的 `kv_q8`/`kv_q4`
 >   格式一致。每 token 的 KV 占用（11 个带 KV 的层 = 10 全注意力 + MTP，2 个 KV 头，HD=256）：
 >   **F32 44 KiB · q8_0 11.7 KiB · int8 11.3 KiB · k8v4 8.0 KiB · q4_0 6.2 KiB** —— 五档 prefill/decode
->   速度与 F32 持平（零损失），256K ctx 的 KV 仅 ~2.84 GiB（int8）/ ~2.92 GiB（q8_0）/ ~1.55 GiB（q4_0）。
+>   速度与 F32 持平（零损失），256K ctx 的 KV 仅 ~2.84 GiB（int8）/ ~2.92 GiB（q8_0）/ ~1.55 GiB（q4_0）；
+>   ④ **专家槽显式化时自动归还 packed Q8_0 decode 副本**：混合专家模式下那 1.28 GiB 的 dense
+>   副本根本没人读（路由专家全部来自 host 池），而上游的归还代码门禁是「仅自动算槽路径」⇒ 显式
+>   `--expert-slots N` 时一直白占。改为「保留装不下、归还装得下」就归还 ⇒ 空闲 4640 → 5920 MiB，
+>   **专家槽上限从 40 提到 48**（双路 200K + 48 槽：60.5 t/s，GPU 命中率 19.9%）。实测保留 vs 归还
+>   产出**完全相同的 token id**，且归还不更慢（55.1 vs 53.3 t/s）；
+>   ⑤ **新增 `--expert-pool <file>`：从离线专家池文件直读路由专家**，省掉每次启动把 17.67 GiB
+>   逐专家 memcpy 进锁页 arena 的 **45.7 s**，也省掉那 17.67 GiB 锁页内存。池文件由
+>   `tools/make_expert_pool.py` 生成、`tools/verify_expert_pool.py` 独立重建比对（10,496 个专家 blob
+>   逐字节一致，0 差异）。
 >
 > 修复的引擎缺陷（相对上游 0.1.45.3）：
 > - **F32 KV 缓存少分配 4 倍**（`kv_half_bytes()` 缺 F32 分支，误用 int8 的 264 B/half，而内核按
@@ -32,11 +42,12 @@
 >   改为 codes / scales 两段拷贝。
 >
 > 验证：跨 4096 边界的 5 个用例全部 20/20 复现文档自身续写；30K token prompt 上 F32 / int8 / q4_0 /
-> k8v4 / q8_0 **逐 token 相同**；生产服务（256K ctx + q8_0）在 **208,837 token** 的上下文里，
-> 首/中/尾三处埋点全部命中、零乱码。
+> k8v4 / q8_0 **逐 token 相同**；**当前生产档（q4_0 KV + 48 专家槽 + 双路 200K）** 在 **192,037 token**
+> 的上下文里，首/中/尾三处埋点全部命中、零乱码（4 档阶梯 28.5K / 57.6K / 116.4K / 192.0K 全过）。
 >
 > 模型转换链：HF NVFP4 safetensors → `convert_hf_to_gguf.py`（NVFP4 repack）→ 共享专家 / dense / MTP BF16
-> 张量重铸为 Q8_0，120 个路由专家保留 NVFP4 + `.scale`（20.4 GB GGUF）。基线测试报告见
+> 张量重铸为 Q8_0，**120 个路由专家张量**（40 层 × gate/up/down，每张量含 256 个专家）保留 NVFP4 +
+> `.scale`（20.4 GiB GGUF）。基线测试报告见
 > `docs/strata-nvfp4-baseline.md`。以下为上游 README。
 
 <p align="center">
@@ -219,8 +230,9 @@ Gyro 可在 NVIDIA 和 AMD 显卡上运行（AMD 为实验性支持），不支�
 - **[Swift 1.5](docs/MODELS.md#swift-15)** 是微调版本，回答前思考的时间更短，质量和内存占用大致相同。
 - **[NVFP4](docs/NVFP4.md)** 是 NVIDIA 为 NVIDIA 显卡提供的 4 位版本。要把所有专家放进内存，需要约 80 GB 内存。
   （这个数字指的是上游 Flash-Next 家族（路由专家 63 GiB）。**NVFP4 格式本身并不要求专家驻留显存** —— 本 fork 的
-  35B-A3B 版本把全部 17.67 GiB 路由专家放在**锁页 host 内存**里，每层只缓存 7–63 / 256 个进显存，
-  其余由 16 线程 CPU pool 计算。见 [docs/strata-nvfp4-baseline.md](docs/strata-nvfp4-baseline.md)。）
+  35B-A3B 版本把全部 17.67 GiB 路由专家放在 **host 内存**里，每层只缓存 48 / 256 个进显存，
+  其余由 16 线程 CPU pool 计算。`--expert-pool` 改为从文件直读，也顺带省掉 45.7 s 的启动拷贝和那份锁页副本。
+  见 [docs/strata-nvfp4-baseline.md](docs/strata-nvfp4-baseline.md)。）
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** 是另一个更小的模型，能看图片，还能同时回答多个请求。
 - **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** 需要手动设置。
 

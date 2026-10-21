@@ -11,10 +11,11 @@
 | prefill pp2048 | **1100–1282 t/s** | ~600 t/s | 437–620 t/s |
 | decode tg128 @32K ctx（用户可见） | **47–55 t/s** | 35–40 t/s | 45.7–67.0 t/s |
 | decode tg128 @96K ctx | ~43 t/s（推断，见下表） | — | 45.7–67.0 t/s |
-| **decode tg128 @256K ctx（生产档）** | **29–33 t/s** | ctx 封顶 96K | ctx 封顶 96K |
+| **decode tg128 @256K ctx（单路）** | **46.5–49.2 t/s**（q4_0 KV + 48 槽） | ctx 封顶 96K | ctx 封顶 96K |
+| **decode tg128 @双路 200K ctx（当前生产档）** | **60.5 t/s**（q4_0 KV + 48 槽 + 归还 packed） | ctx 封顶 96K | ctx 封顶 96K |
 | decode 裸 forward（÷ mean len） | 47–55 t/s | 35–40 t/s | **~20 t/s**（3.53–3.75 tok/forward） |
-| 上下文上限（16 GB 卡） | **256K**（q8_0 KV，2.92 GiB） | 96K（脚本实测上限） | 96K（脚本实测上限） |
-| 208K prompt 正确性 | **3/3 埋点命中，零乱码** | 未测 | 未测 |
+| 上下文上限（16 GB 卡） | **单路 256K**（q4_0 KV，1.55 GiB）/ **双路 200K×2** | 96K（脚本实测上限） | 96K（脚本实测上限） |
+| 192K prompt 正确性（当前生产档） | **3/3 埋点命中，零乱码** | 未测 | 未测 |
 
 - **三列的主模型是同一份权重**：两个 llama.cpp 档跑的都是 `models/Ornith-1.5-35B-A3B-NVFP4.gguf`（23.85 GB，W4A8）。
   DFlash 是**投机解码的草稿模型**（`Ornith-1.5-35B-A3B-DFlash-q8_0.gguf`，402 MB，`--spec-type draft-dflash --spec-draft-n-max 4`），
@@ -32,7 +33,7 @@
 
 | 路线 | 专家放在哪 | 机制 |
 |---|---|---|
-| **Strata q36** | **全部 17.67 GiB 在锁页 host 内存**（`cudaHostAlloc`），每层只让 7–63 / 256 个进 VRAM（0.48–4.35 GiB） | 未驻留的专家走 16 线程 CPU pool 算，prefill 的大 chunk 经 PCIe 流式送入（1.59 GiB staging） |
+| **Strata q36** | **全部 17.67 GiB 在 host 内存**（默认 `cudaHostAlloc` 锁页；`--expert-pool` 改为文件映射），每层只让 21–63 / 256 个进 VRAM（1.45–4.35 GiB，生产档 48 个 = 3.31 GiB） | 未驻留的专家走 16 线程 CPU pool 算，prefill 的大 chunk 经 PCIe 流式送入（1.59 GiB staging） |
 | **llama.cpp b11539** | 前 `--n-cpu-moe 18` 层的 MoE 权重留在 **CPU**，其余进 VRAM | CPU 后端有 NVFP4 的 `ggml_vec_dot_nvfp4_q8_0`（`ggml-cpu.c` 的 `[GGML_TYPE_NVFP4]` traits），CPU 侧能直接算 NVFP4 专家；另有 `--moe-cache-mib` 给 CPU 上的专家做 GPU cache |
 
 实测（`8090_ornith_nvfp4_cpu18.bat`）：
@@ -50,10 +51,16 @@ HF NVFP4 safetensors (W4A8, 22GB, ModelOpt)
   → convert_hf_to_gguf.py (NVFP4 repack: 专家 NVFP4 + dense BF16 + .scale F32)
   → fix_router_shape.py (41 个 ffn_gate_inp_shexp 退化 2D [2048,1] → 1D [2048])
   → make_q36_gguf.py (Strata q36 定制，20.4GB)：
-      · 120 个 routed experts (blk.0-39 × gate/up/down) 保留 NVFP4 + .scale F32
-      · 120 个 shexp NVFP4 → Q8_0（dequant+requant，含 weight_scale_2）
-      · 201 个 dense BF16 → Q8_0（含 MTP 层 BF16 专家、attention 投影）
-      · 553 个原样（router F32、norms、token_embd BF16、output.weight NVFP4+.scale）
+      · 120 个 routed expert **张量** (blk.0-39 × gate/up/down，每张量含 256 个专家) 保留 NVFP4
+        （另 120 个同名 F32 `.scale` 保留为 F32，MTP 块的 3 个 routed expert 是 Q8_0）
+      · 123 个 shexp NVFP4 → Q8_0（dequant+requant，含 weight_scale_2）
+      · 221 个 dense BF16 → Q8_0（含 MTP 层 BF16 专家、attention 投影、SSM 投影）
+      · 其余原样（router F32、norms、token_embd BF16、output.weight NVFP4+.scale）
+
+> 转换链产出 994 个张量，类型直方图实测：`551 F32 + 321 Q8_0 + 121 type 40 (NVFP4) + 1 BF16`。
+> ⇒ **type 40 的 121 个 = 120 个 routed expert 张量 + 1 个 `output.weight`**。
+> （上游那份未做 q36 定制，`Ornith-1.5-35B-A3B-NVFP4.gguf` 23.85 GB 的 type 40 是 241 个，
+> 因为它的 shexp 也是 NVFP4 未转 Q8_0 —— **不是同一份文件，别混用**。）
 ```
 
 ## 引擎 patch（全部已编译进 strata-q36.exe / strata.exe）
@@ -160,8 +167,9 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 |---|---|---|---|---|
 | 32K / int8 | 6.74 GiB | 63（4.35 GiB） | 39.5% | 47–55 t/s（bench 档） |
 | 64K / q8_0 | 6.21 GiB | 55（3.80 GiB） | — | ~43 t/s |
-| 256K / q8_0 + 21 slots（旧生产档） | 2.89 GiB | 7（0.48 GiB） | **8.1%** | 29–33 t/s（长 prompt 10.3） |
-| **256K / q4_0 + 48 slots（当前生产档）** | **3.31 GiB** | **48（3.31 GiB）** | **24.5%** | **46.5–49.2 t/s** |
+| 256K / q8_0 + 21 slots（更早的生产档） | 2.89 GiB | 7（0.48 GiB） | **8.1%** | 29–33 t/s（长 prompt 10.3） |
+| 256K / q4_0 + 48 slots（单路档） | 3.31 GiB | **48（3.31 GiB）** | **24.5%** | **46.5–49.2 t/s** |
+| **双路 200K / q4_0 + 48 slots（当前生产档）** | 余 767 MiB | **48（3.31 GiB）** | **19.9%** | **60.5 t/s** |
 
 - 这是**上下文长度、KV 精度、专家驻留、decode 速度的四方交换**：要 256K 就得压 KV 档位，
   压出来的显存换成专家驻留，命中率上去后 decode 才回来。
@@ -225,6 +233,24 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 
 环境变量：`STRATA_Q36_KEEP_PACKED=1` 保留副本、拒绝交易；`STRATA_Q36_GIVE_PACKED=1` 强制归还（对比两条 decode 路径用）。
 
+#### 双槽 200K + 48 槽的长上下文门禁（2026-10-21 16:00，当前生产档）
+
+上生产前的最后一关。档位脚本 `_tmp_code/ctxladder2.py`，打生产服务真实 HTTP 路径，
+每档 3 处埋点（开头 / 中间 / 结尾）必须逐字命中。
+
+| 档位 | 耗时 | prompt_tokens | 埋点命中 | finish |
+|---|---|---|---|---|
+| ~25K | 49 s | 28,539 | **3/3** | stop |
+| ~50K | 70 s | 57,638 | **3/3** | stop |
+| ~100K | 203 s | 116,437 | **3/3** | stop |
+| **~180K** | 551 s | **192,037** | **3/3** | stop |
+
+零乱码、零 `/` 死循环、零 token 沙拉，四档答案一致（紫罗兰色的风筝 / 第零号齿轮 / 青铜色的怀表）。
+
+> ⚠️ 档位必须按 ctx 调：双槽后每路 ctx 从 256K 降到 204.8K，5000 行 = 208,837 token 会被引擎
+> **明确 400 拒绝**（`prompt leaves no room to answer in the context`）—— **这不是 bug，是引擎不截断**。
+> 已把最后一档从 5000 行改为 4600 行。
+
 #### ⚠️ 术语澄清：Strata 语境下有两个「pack」，不是一回事
 
 「packed」这个词在 Strata 里有**两个完全不同的所指**，混起来会得出错误结论
@@ -232,7 +258,7 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 
 | | **A · 专家 pack** | **B · Q8_0 dense decode 副本** |
 |---|---|---|
-| 是什么 | 243 个 `type 40`（NVFP4）张量：`blk.N.ffn_{gate,up,down}_exps.weight` | 154 个 **dense** Q8_0 张量的第二份拷贝：`attn_qkv`(n_out=8192, 41 个)、`attn_gate`(4096, 30 个)、`ffn_*_shexp`(2048, 83 个) |
+| 是什么 | **121 个 `type 40`（NVFP4）张量**：`blk.N.ffn_{gate,up,down}_exps.weight`（40 层 × 3）+ `output.weight` | **157 个**满足 packed 形状门槛的 Q8_0 张量的第二份拷贝：`attn_qkv`(n_out=8192, 30 个)、`attn_q`/`attn_output`(11 个)、`attn_gate`(4096, 30 个)、`ffn_down_shexp`(2048, 41 个)、`ssm_out`(30 个)、`nextn.eh_proj` 与 MTP 块 3 个专家等 |
 | 干什么用 | **专家卸载机制的前提** —— 专家能按层拆开搬进 VRAM 槽，未驻留的走 CPU pool 补算 | 只服务 attention 与 shared expert 的 decode，走 `q8_packed_mmvq()` 快速路径 |
 | 显存 | 就是路由专家本体的 17.67 GiB（锁页 host 内存 + 每层驻留槽） | **额外 1.28 GiB**（GGUF 原版已另有一份在显存） |
 | 官方 35B 有吗 | **没有**。Strata 官方只给 **Qwen3.8-Flash-Next** 出了 NVFP4 pack；Qwen3.5-35B 无 | 不涉及模型版本，是引擎特性 |
@@ -250,7 +276,9 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 GGUF 张量类型直方图（自写解析器，994 个张量）：
 `551 F32 + 321 Q8_0 + 121 type 40 (NVFP4) + 1 BF16`。
 其中 157 个 Q8_0 满足 packed 形状门槛（`n_in % 32 == 0 && n_out >= 2048`，`native_mmvq.cu:2048`），
-**且全部是 dense 张量** ⇒ 引擎建出来的 B 副本只覆盖 attention + shared expert，**一个路由专家都没碰**。
+**绝大多数是 dense 张量**（attention 投影 + shared expert + SSM 投影），只有 3 个是 MTP 块的
+Q8_0 专家张量 ⇒ 引擎建出来的 B 副本**不覆盖任何一个 NVFP4 路由专家**，
+**专家卸载机制完全没被它碰到**（40 主层的 120 个 routed expert 张量是 type 40，走 MMQ 路径）。
 
 **B 副本为何会被建**：`q36_engine.cu:4238` 一句 `setenv("STRATA_Q8_PACKED", "1", 0)`
 把它**默认强制打开**（`native_q8_0_packed_enabled()` 返回 `enabled || q8_sm60_on()`），
@@ -307,6 +335,9 @@ WDDM 下 `nvidia-smi` 只报物理 VRAM 且饱和后失真：生产跑满时它�
 
 ### 若要再往上走（未采用，供后续参考）
 
+> ⚠️ 本节是**单路 256K** 语境（当时的生产档）。现生产档已改为**双路 200K + 48 槽**，
+> 下面的旋钮需按双路的 KV 占用（2 × 1.27 GiB）重新核算。
+
 专家池已经吃掉 3.31 GiB，256K 的 KV（q4_0，1.55 GiB）也已到位。剩下的旋钮：
 
 | 手段 | 效果 | 代价 |
@@ -315,10 +346,13 @@ WDDM 下 `nvidia-smi` 只报物理 VRAM 且饱和后失真：生产跑满时它�
 | `--kv k8v4`（5.0 KiB/token，比 q4_0 再省 0.37 GiB） | 多 ~7 slots | KV 精度档更激进，尚未做长上下文对拍 |
 | `--max-context` 降到 192K | 专家驻留回 55/256，decode 43+ | 放弃 256K 能力 |
 
-> **当前生产档** `strata-ornith-nvfp4-8090.json` = `--max-context 262144 --kv q4_0 --expert-slots 48 --mtp 2`
-> （`start_strata_8090.bat` 同步）。实测峰值显存 15218 MiB，短问答 3 题全通过
-> （MoE 解释正常、翻译正常、`1234*5678=7006652` 精确）。
-> q4_0 是精度最低的 KV 档，上生产前必须过长上下文验收 —— 见下节。
+> **当前生产档** `strata-ornith-nvfp4-8090.json`
+> = `--max-context 204800 --kv q4_0 --expert-slots 48 --prefill auto --mtp 2 --batch 2`
+> （**双路 200K + 48 专家槽**；`start_strata_8090.bat` 同步）。
+> 双路 200K 与 48 槽是绑定的一档：单路时 48 槽装得下但 ctx 需求减半。
+> 实测短问答 3 题全通过（MoE 解释正常、翻译正常、`1234*5678=7006652` 精确），
+> 长上下文 4 档阶梯（28.5K / 57.6K / 116.4K / 192.0K）全部 3/3 命中、零乱码。
+> q4_0 是精度最低的 KV 档，上生产前必须过长上下文验收 —— 见上节。
 
 ## 基准明细
 
@@ -391,8 +425,15 @@ GGUF 里专家张量的排列：`blk.N.ffn_{gate,up,down}_exps.weight` 的 ne �
 `tools/verify_expert_pool.py` **独立**从 GGUF 重建 blob 再与文件比对（不复用写入器的代码路径）：
 **10,496 个专家 blob（41 块 × 256）逐字节一致，0 差异**。
 
+另一个强交叉验证：脚本算出的总大小 **17.67 GiB 与引擎实测的专家池大小精确一致**。
+
+本机产物：`D:\MyLLM\models\experts-q36.bin`（18,976,632,832 B = 17.67 GiB），
+生成耗时 **84.3 s**，sha256 前缀 `2025de41…`。
+
 ### 待办
 
 - **端到端验证未做**（10-21 16:00 时 8090 被另一会话的 `llama-server.exe` 占满 16024/16311 MiB）：
   需实测 ① 启动时间 ② 输出与无池路径逐 token 相同 ③ CPU 补算速度（mmap 页 vs 锁页内存的差异）。
+  **③ 是主要未知风险** —— mmap 页有 page fault 开销，锁页内存没有；变慢则需加预热（启动时顺序 touch 全部页）。
 - 未上生产：`strata-ornith-nvfp4-8090.json` 暂未加 `--expert-pool`。
+- 对比脚本已备好：`_tmp_code/pool_parity.py`（照 `packed_parity.py` 的模式，A=无池 B=有池，比 token id + READY 时间）。
