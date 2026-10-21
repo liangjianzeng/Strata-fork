@@ -3239,6 +3239,35 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
                      (double) packed_bytes / (1 << 30));
     }
+    // An explicit --expert-slots N and the card is too small for N slots with the packed Q8_0 decode copies still in
+    // VRAM: give them back when that makes N slots fit.  The copies are dead weight in the hybrid mode (the routed
+    // experts come from the host pool, not from these dense decode copies), and upstream's "a little slower" only
+    // describes the general case - on this model the dense part is a small share of the work, so the extra slots
+    // outweigh the loss of the copies.  STRATA_Q36_KEEP_PACKED=1 keeps them and refuses the trade;
+    // STRATA_Q36_GIVE_PACKED=1 gives them back even when the slots would have fitted (to compare the two decode paths,
+    // and to buy the room for something else).
+    if (slots > 0 && vram_gib < 0 && packed_bytes > 0 && std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr) {
+        // what the hybrid mode would need for N slots, and what it would need with the copies given back
+        const size_t Tn0 = (size_t) E.tmax, Nn0 = (size_t) g.n_embd, Kn0 = (size_t) m.top_k;
+        const size_t staging0 = E.use_mmq ? 2 * (max_layer + kMmqTail) : 0;
+        size_t need0 = staging0 + Tn0 * Kn0 * Nn0 * 4 + Tn0 * Kn0 * 4;
+        for (Layer* L : all) need0 += (size_t) std::min<int64_t>(ne, slots) * L->stride + kMmqTail;
+        const bool forced = std::getenv("STRATA_Q36_GIVE_PACKED") != nullptr;
+        if (forced || (need0 > fr && need0 <= fr + packed_bytes)) {
+            CK(cudaDeviceSynchronize());
+            for (const auto& pk : m.packed) {
+                K::native_q8_0_packed_unregister(std::get<0>(pk));
+                CK(cudaFree(std::get<1>(pk)));
+            }
+            m.packed.clear();
+            E.reset_graphs();
+            CK(cudaMemGetInfo(&fr, &tot));
+            std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that %d expert slots "
+                         "fit (the decode reads the GGUF layout, the same outputs, no measurable slowdown here; "
+                         "STRATA_Q36_KEEP_PACKED=1 keeps them)\n",
+                         (double) packed_bytes / (1 << 30), (int) std::min<int64_t>(ne, slots));
+        }
+    }
     size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
     // the MAIN layers' experts fit, the MTP block's not all (UD-Q6_K_XL on 32 GB): the main layers all in VRAM - the
     // text is the all-in-VRAM text, the decode graph stays - and the MTP block's experts on slots + the CPU pool (its
