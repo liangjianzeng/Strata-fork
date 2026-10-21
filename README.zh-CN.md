@@ -2,10 +2,16 @@
 > **Fork：为 qwen35moe 家族加入 NVFP4（ModelOpt）原生支持** —— 在 16GB RTX 5060 Ti 上原生运行
 > [Ornith-1.5-35B-A3B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4)
 > （W4A8 量化，256 选 8 专家，10 全注意力层 + 30 GDN/SSM 层 + 1 MTP 块）：
-> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / ~60 tok/s @双路 200K ctx（q4_0 KV + 48 expert slots）**
+> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / 60.5 tok/s @双路 200K ctx（q4_0 KV + 48 expert slots）**
 > （混合专家池：**全部 17.67 GiB 路由专家常驻 host 内存**，每层只让 48 / 256 个进显存
 > —— **NVFP4 不要求专家全部驻留显存**；ctx 越大留给专家池的 VRAM 越少，decode 越慢）。
-> **并发**：`--batch 2` 同时解码两路会话，每路各一份完整 KV（单路 256K，或双路 200K×2）。
+> **当前生产档**：`--max-context 262144 --kv q8_0 --expert-slots 48 --prefill auto --mtp 2 --vision`
+> —— 单槽 256K（**未加 `--batch`**；每路并发一整份完整 KV，不共享不分片）、Q8 KV（11.7 KiB/token，
+> 2.92 GiB）、48 专家槽（3.31 GiB）、视觉走 CPU（mmproj 899 MB 落 host RAM、不占显存 ⇒ 48 槽保住）。
+> decode 36–43 t/s（比 q4_0 档低 20–25%，这就是抬高 KV 精度的代价）。
+> **并发**：加 `--batch N` 即 N 路并发，KV 需求 ×N（`q4_0 + 双路 200K` 实测 60.5 t/s）。
+> ⚠️ 起视觉前必须让 `cublas64_13.dll` 可被解析（`PATH` 里有 CUDA 13 运行库目录）——mmproj 走 CPU
+> 不代表 exe 不链接 CUDA；缺库时报错为空（`the vision encoder did not start:` 后无内容）。
 >
 > 相对上游（engine 0.1.45.3）的改动：
 > - `include/strata/core/family_layout.hpp` —— layout 校验放行 NVFP4 的 `.scale` 张量，以及 Q8_0 重打包后
@@ -42,8 +48,8 @@
 >   改为 codes / scales 两段拷贝。
 >
 > 验证：跨 4096 边界的 5 个用例全部 20/20 复现文档自身续写；30K token prompt 上 F32 / int8 / q4_0 /
-> k8v4 / q8_0 **逐 token 相同**；**当前生产档（q4_0 KV + 48 专家槽 + 双路 200K）** 在 **192,037 token**
-> 的上下文里，首/中/尾三处埋点全部命中、零乱码（4 档阶梯 28.5K / 57.6K / 116.4K / 192.0K 全过）。
+> k8v4 / q8_0 **逐 token 相同**；生产档在 **192,037 token** 的上下文里，首/中/尾三处埋点全部命中、
+> 零乱码（4 档阶梯 28.5K / 57.6K / 116.4K / 192.0K 全过）。
 >
 > 模型转换链：HF NVFP4 safetensors → `convert_hf_to_gguf.py`（NVFP4 repack）→ 共享专家 / dense / MTP BF16
 > 张量重铸为 Q8_0，**120 个路由专家张量**（40 层 × gate/up/down，每张量含 256 个专家）保留 NVFP4 +

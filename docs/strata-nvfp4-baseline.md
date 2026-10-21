@@ -11,11 +11,12 @@
 | prefill pp2048 | **1100–1282 t/s** | ~600 t/s | 437–620 t/s |
 | decode tg128 @32K ctx（用户可见） | **47–55 t/s** | 35–40 t/s | 45.7–67.0 t/s |
 | decode tg128 @96K ctx | ~43 t/s（推断，见下表） | — | 45.7–67.0 t/s |
-| **decode tg128 @256K ctx（单路）** | **46.5–49.2 t/s**（q4_0 KV + 48 槽） | ctx 封顶 96K | ctx 封顶 96K |
-| **decode tg128 @双路 200K ctx（当前生产档）** | **60.5 t/s**（q4_0 KV + 48 槽 + 归还 packed） | ctx 封顶 96K | ctx 封顶 96K |
+| **decode tg128 @256K ctx（单路，q4_0 KV）** | **46.5–49.2 t/s**（48 槽） | ctx 封顶 96K | ctx 封顶 96K |
+| **decode tg128 @双路 200K ctx（q4_0 KV）** | **60.5 t/s**（48 槽 + 归还 packed） | ctx 封顶 96K | ctx 封顶 96K |
+| **decode tg128 @256K ctx（当前生产档，q8_0 KV）** | **36–43 t/s**（48 槽，视觉开） | ctx 封顶 96K | ctx 封顶 96K |
 | decode 裸 forward（÷ mean len） | 47–55 t/s | 35–40 t/s | **~20 t/s**（3.53–3.75 tok/forward） |
-| 上下文上限（16 GB 卡） | **单路 256K**（q4_0 KV，1.55 GiB）/ **双路 200K×2** | 96K（脚本实测上限） | 96K（脚本实测上限） |
-| 192K prompt 正确性（当前生产档） | **3/3 埋点命中，零乱码** | 未测 | 未测 |
+| 上下文上限（16 GB 卡） | **单路 256K**（q8_0 2.92 GiB 或 q4_0 1.55 GiB）/ **双路 200K×2** | 96K（脚本实测上限） | 96K（脚本实测上限） |
+| 192K prompt 正确性 | **3/3 埋点命中，零乱码** | 未测 | 未测 |
 
 - **三列的主模型是同一份权重**：两个 llama.cpp 档跑的都是 `models/Ornith-1.5-35B-A3B-NVFP4.gguf`（23.85 GB，W4A8）。
   DFlash 是**投机解码的草稿模型**（`Ornith-1.5-35B-A3B-DFlash-q8_0.gguf`，402 MB，`--spec-type draft-dflash --spec-draft-n-max 4`），
@@ -111,7 +112,7 @@ MMQ 乘积只带了 per-block scale，blob 尾包的 per-expert `weight_scale_2 
 
 服务：`serve.server --engine strata --config strata-ornith-nvfp4-8090.json --port 8090`，`--max-context 262144 --kv q8_0 --mtp 2`，VRAM 14654 / 16311 MiB。
 
-> 下表是 **q8_0 KV 档**的结果。**q4_0 + 48 slots 档的复测见下一节**（当前生产档，已 ALL CLEAN）。
+> 下表是 **q8_0 KV 档**的结果。**q4_0 + 48 slots 档的复测见下一节**（已 ALL CLEAN）。
 
 | 测试 | prompt_tokens | 耗时 | 结果 |
 |---|---|---|---|
@@ -124,10 +125,10 @@ MMQ 乘积只带了 per-block scale，blob 尾包的 per-expert `weight_scale_2 
 | 埋点阶梯 ~100K | 116,437 | 206 s | 3/3 命中，零乱码 |
 | **埋点阶梯 ~180K** | **208,837** | 606 s | **3/3 命中，零乱码** |
 
-### q4_0 KV + 48 slots 生产档复测（2026-10-21 晚，当前生产配置）
+### q4_0 KV + 48 slots 单路 256K 档复测（2026-10-21 晚）
 
 `--max-context 262144 --kv q4_0 --expert-slots 48 --mtp 2`，峰值显存 15218 MiB。
-q4_0 是**精度最低的 KV 档**（每 32 值一个 fp16 scale），上生产前必须重跑同一套验收。
+q4_0 是**精度最低的 KV 档**（每 32 值一个 fp16 scale）。
 
 | 测试 | prompt_tokens | 耗时 | 结果 |
 |---|---|---|---|
@@ -146,6 +147,38 @@ q4_0 是**精度最低的 KV 档**（每 32 值一个 fp16 scale），上生产�
 
 - ⚠️ `finish=length` + `content` 为空 ≠ 故障：模型有思考链，答案在 `reasoning_content` 里，max_tokens 太小会被思考链吃满 —— **取结果要合并两个字段**。
 - ⚠️ HTTP `/v1/chat/completions` 无状态：多轮「不记得上一句」是 API 语义（历史由客户端带回），非引擎缺陷。
+
+### q8_0 KV + 48 slots + 视觉（当前生产档，2026-10-21 18:00 起）
+
+```
+--max-context 262144  --kv q8_0  --expert-slots 48  --prefill auto  --mtp 2  --vision
+```
+
+单槽 256K（**删掉 `--batch 2` 回单槽**）。KV 从 q4_0 的 1.55 GiB 涨到 **2.92 GiB**，48 专家槽 3.31 GiB 不变，
+CPU 加载 mmproj 所以视觉不吃显存 —— 三者仍能共存。
+
+**性能（短请求，含 thinking budget）**：decode **36.2 / 37.0 / 39.3 / 36.0 / 39.1 / 43.3 t/s**（6 轮）。
+比 q4_0 档的 46.5–49.2 t/s **降 20–25%**，与 KV 每 token 从 6.2 KiB 涨到 11.7 KiB 的预期一致。
+
+**视觉：曾因缺 CUDA 运行库起不来（已修）**
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| `RuntimeError: the vision encoder did not start:`（**冒号后为空**） | config 无 `"log"` 键 ⇒ 编码器 stderr 进 DEVNULL，真实原因被吞 | 手动跑 `strata-vision.exe` 才看到真因 |
+| `error while loading shared libraries: cublas64_13.dll` | 该 DLL 不在 System32、也不在 `strata-vision.exe` / `strata-build2\` 旁边 | 启动前 `set "PATH=D:\MyLLM\llama.cpp;%PATH%"` |
+
+- ⚠️ **mmproj 走 CPU ≠ exe 不依赖 CUDA**：视觉编码器启动时仍要链接 `cublas64_13.dll`。手头唯一干净副本在
+  `D:\MyLLM\llama.cpp\`（CUDA 13.4 自包含构建）—— **那个目录不能删**，删了视觉立刻挂。
+- CPU 模式下手动运行会打两行**正常**日志，别误判为故障：
+  `ggml_cuda_init: failed to initialize CUDA`（没有 `--gpu` 就这样）、
+  `load_hparams: Qwen-VL models require at minimum 1024 image tokens`（当前默认 2048）。
+- `vision_env()` 只认 `cuda_device`，**不支持任意自定义 env** ⇒ 只能从启动脚本注入 PATH。
+- 手动验证：注入 PATH 后 **6.2 s 就绪**，输出 `READY 2048` + `on the CPU, 16 threads, no warm-up`。
+- 配置段写法：`"vision": {"exe", "mmproj", "model", "gpu": false, "threads": 16}`；`gpu:false` = mmproj 落 host RAM。
+  serve 层逻辑（`server.py:2878`）：**有** vision 段但 args 缺 `--vision` 会自动补；**没有** vision 段则编码器根本不启动。
+- ⚠️ **该模型输出走 `reasoning_content` 而非 `content`**（thinking 风格）。`max_tokens` 用尽时
+  `content = null` + `finish=length`，脚本直接读 `content` 会 TypeError；**必须带 `reasoning_budget_tokens`**，
+  否则日志刷 `the reply reached max tokens while still thinking`。
 
 
 ## 运行时行为（默认参数）
@@ -169,7 +202,8 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 | 64K / q8_0 | 6.21 GiB | 55（3.80 GiB） | — | ~43 t/s |
 | 256K / q8_0 + 21 slots（更早的生产档） | 2.89 GiB | 7（0.48 GiB） | **8.1%** | 29–33 t/s（长 prompt 10.3） |
 | 256K / q4_0 + 48 slots（单路档） | 3.31 GiB | **48（3.31 GiB）** | **24.5%** | **46.5–49.2 t/s** |
-| **双路 200K / q4_0 + 48 slots（当前生产档）** | 余 767 MiB | **48（3.31 GiB）** | **19.9%** | **60.5 t/s** |
+| 双路 200K / q4_0 + 48 slots | 余 767 MiB | **48（3.31 GiB）** | **19.9%** | **60.5 t/s** |
+| **256K / q8_0 + 48 slots + 视觉（当前生产档）** | KV 2.92 GiB | **48（3.31 GiB）** | — | **36–43 t/s** |
 
 - 这是**上下文长度、KV 精度、专家驻留、decode 速度的四方交换**：要 256K 就得压 KV 档位，
   压出来的显存换成专家驻留，命中率上去后 decode 才回来。
@@ -229,11 +263,11 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 | 档位 | decode | GPU 命中率 |
 |---|---|---|
 | 双槽 200K + 40 槽（保留副本，旧上限） | 56.5 t/s | — |
-| **双槽 200K + 48 槽（归还副本，当前生产档）** | **60.5 t/s** | **19.9%** |
+| **双槽 200K + 48 槽（归还副本，q4_0 档）** | **60.5 t/s** | **19.9%** |
 
 环境变量：`STRATA_Q36_KEEP_PACKED=1` 保留副本、拒绝交易；`STRATA_Q36_GIVE_PACKED=1` 强制归还（对比两条 decode 路径用）。
 
-#### 双槽 200K + 48 槽的长上下文门禁（2026-10-21 16:00，当前生产档）
+#### 双槽 200K + 48 槽的长上下文门禁（2026-10-21 16:00，q4_0 档）
 
 上生产前的最后一关。档位脚本 `_tmp_code/ctxladder2.py`，打生产服务真实 HTTP 路径，
 每档 3 处埋点（开头 / 中间 / 结尾）必须逐字命中。
@@ -272,6 +306,11 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
 转换链产出的就是「专家 NVFP4 + dense Q8_0」两段式布局，**A 种 pack 形态天然具备**。
 
 > 另有 `Ornith-1.5-35B-A3B-NVFP4.gguf`（23.85 GB，10-20）是另一份文件，不是生产档用的那份。
+> **两个 GGUF 中间产物都能从 `models/ornith-nvfp4/`（21.84 GiB safetensors，ModelScope 下载，
+> 脚本 `models/ornith-nvfp4/dl.sh`）重建** —— 4 分钟重转第一个，84 秒重建专家池。
+> ⚠️ `models/ornith-nvfp4/` **绝不能删**：它既是转换链源头，又是当前 8090 配置的 `"tokenizer"` 目录。
+> ⚠️ 10-20 曾删掉 23.8 GB 的 `-fix.gguf` 中间产物而**磁盘空闲没有回升** ⇒ 真要清理前，
+> 先拿一个小文件验证删除确实释放了空间，别删完 40 G 才发现还在。
 
 GGUF 张量类型直方图（自写解析器，994 个张量）：
 `551 F32 + 321 Q8_0 + 121 type 40 (NVFP4) + 1 BF16`。
@@ -335,24 +374,25 @@ WDDM 下 `nvidia-smi` 只报物理 VRAM 且饱和后失真：生产跑满时它�
 
 ### 若要再往上走（未采用，供后续参考）
 
-> ⚠️ 本节是**单路 256K** 语境（当时的生产档）。现生产档已改为**双路 200K + 48 槽**，
-> 下面的旋钮需按双路的 KV 占用（2 × 1.27 GiB）重新核算。
+> ⚠️ 本节是**单路 256K + q4_0 KV** 语境（当时的档位）。现生产档为**单路 256K + q8_0 KV + 视觉**，
+> KV 占用 2.92 GiB（q4_0 的 1.88 倍），下面的旋钮需按此重新核算。
 
-专家池已经吃掉 3.31 GiB，256K 的 KV（q4_0，1.55 GiB）也已到位。剩下的旋钮：
+专家池已经吃掉 3.31 GiB，256K 的 KV 也已到位。剩下的旋钮：
 
 | 手段 | 效果 | 代价 |
 |---|---|---|
 | 改 `need > fr` 核算让其动用 768 MiB reserve | 理论上可再放 ~10 slots（≈56） | 改引擎显存核算，需重编译 + 重跑 20/20 回归 |
-| `--kv k8v4`（5.0 KiB/token，比 q4_0 再省 0.37 GiB） | 多 ~7 slots | KV 精度档更激进，尚未做长上下文对拍 |
-| `--max-context` 降到 192K | 专家驻留回 55/256，decode 43+ | 放弃 256K 能力 |
+| `--kv k8v4`（8.0 KiB/token，比 q8_0 省 ~1.1 GiB） | 多 ~15 slots，或退回双路 256K×2 | KV 精度档更激进，尚未做长上下文对拍 |
+| `--max-context` 降到 192K | 专家驻留回 55+/256，decode 43+ | 放弃 256K 能力 |
+| 加 `--batch 2` 做双路并发 | q4_0 档实测 60.5 t/s | KV ×2 ⇒ 必须降 KV 精度或 ctx（200K） |
 
 > **当前生产档** `strata-ornith-nvfp4-8090.json`
-> = `--max-context 204800 --kv q4_0 --expert-slots 48 --prefill auto --mtp 2 --batch 2`
-> （**双路 200K + 48 专家槽**；`start_strata_8090.bat` 同步）。
-> 双路 200K 与 48 槽是绑定的一档：单路时 48 槽装得下但 ctx 需求减半。
-> 实测短问答 3 题全通过（MoE 解释正常、翻译正常、`1234*5678=7006652` 精确），
-> 长上下文 4 档阶梯（28.5K / 57.6K / 116.4K / 192.0K）全部 3/3 命中、零乱码。
-> q4_0 是精度最低的 KV 档，上生产前必须过长上下文验收 —— 见上节。
+> = `--max-context 262144 --kv q8_0 --expert-slots 48 --prefill auto --mtp 2 --vision`
+> （**单路 256K + q8_0 KV + 48 专家槽 + 视觉走 CPU**；`start_strata_8090.bat` 同步）。
+> 视觉段 `gpu: false` ⇒ BF16 mmproj 899 MB 落 host RAM，**不占显存**，所以 48 槽得以保住。
+> 实测 decode 36–43 t/s，比 q4_0 档低 20–25%（换来更高的 KV 精度）。
+> ⚠️ 起视觉前启动脚本必须注入 CUDA 13 运行库目录到 `PATH`（`cublas64_13.dll`）—— 详见上文视觉小节。
+> 长上下文 4 档阶梯（28.5K / 57.6K / 116.4K / 192.0K）在同档位下全部 3/3 命中、零乱码。
 
 ## 基准明细
 
