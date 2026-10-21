@@ -1,0 +1,33 @@
+{
+  "arch": "qwen35moe",
+  "exe": "D:\\MyLLM\\strata-build2\\strata.exe",
+  "cwd": "D:\\MyLLM\\strata-build2",
+  "args": [
+    "--model",
+    "D:/MyLLM/models/Ornith-1.5-35B-A3B-NVFP4-q36.gguf",
+    "--max-context",
+    "262144",
+    "--kv",
+    "q8_0",
+    "--expert-slots",
+    "48",
+    "--prefill",
+    "auto",
+    "--mtp",
+    "2",
+    "--vision",
+    "--expert-pool",
+    "D:/MyLLM/models/experts-q36.bin"
+  ],
+  "tokenizer": "D:/MyLLM/models/ornith-nvfp4",
+  "model_name": "Ornith-1.5-35B-NVFP4",
+  "host": "0.0.0.0",
+  "api_key": "sk-llama-d5c7afa0e6f1a9f423364ee5b87e9c28e960342c6ba0d979a5d0b620079fae50",
+  "vision": {
+    "exe": "D:/MyLLM/strata-run/strata-vision.exe",
+    "mmproj": "D:/MyLLM/models/mmproj-Ornith-1.5-35B-BF16.gguf",
+    "model": "D:/MyLLM/models/Ornith-1.5-35B-A3B-NVFP4-q36.gguf",
+    "gpu": false,
+    "threads": 16
+  }
+}
