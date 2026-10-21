@@ -2,7 +2,9 @@
 > **Fork：为 qwen35moe 家族加入 NVFP4（ModelOpt）原生支持** —— 在 16GB RTX 5060 Ti 上原生运行
 > [Ornith-1.5-35B-A3B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4)
 > （W4A8 量化，256 选 8 专家，10 全注意力层 + 30 GDN/SSM 层 + 1 MTP 块）：
-> **prefill ~1300 tok/s，decode ~50 tok/s**（混合专家池：63/256 专家驻留显存 + 17.7 GiB 锁页内存）。
+> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / ~48 tok/s @256K ctx（q4_0 KV + 48 expert slots）**
+> （混合专家池：**全部 17.67 GiB 路由专家常驻锁页 host 内存**，每层只让 7–63 / 256 个进显存
+> —— **NVFP4 不要求专家全部驻留显存**；ctx 越大留给专家池的 VRAM 越少，decode 越慢）。
 >
 > 相对上游（engine 0.1.45.3）的改动：
 > - `include/strata/core/family_layout.hpp` —— layout 校验放行 NVFP4 的 `.scale` 张量，以及 Q8_0 重打包后
@@ -216,6 +218,9 @@ Gyro 可在 NVIDIA 和 AMD 显卡上运行（AMD 为实验性支持），不支�
 
 - **[Swift 1.5](docs/MODELS.md#swift-15)** 是微调版本，回答前思考的时间更短，质量和内存占用大致相同。
 - **[NVFP4](docs/NVFP4.md)** 是 NVIDIA 为 NVIDIA 显卡提供的 4 位版本。要把所有专家放进内存，需要约 80 GB 内存。
+  （这个数字指的是上游 Flash-Next 家族（路由专家 63 GiB）。**NVFP4 格式本身并不要求专家驻留显存** —— 本 fork 的
+  35B-A3B 版本把全部 17.67 GiB 路由专家放在**锁页 host 内存**里，每层只缓存 7–63 / 256 个进显存，
+  其余由 16 线程 CPU pool 计算。见 [docs/strata-nvfp4-baseline.md](docs/strata-nvfp4-baseline.md)。）
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** 是另一个更小的模型，能看图片，还能同时回答多个请求。
 - **[OrcaRouter 的 Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** 需要手动设置。
 

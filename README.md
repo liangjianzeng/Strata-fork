@@ -2,7 +2,9 @@
 > **Fork：为 qwen35moe 家族加入 NVFP4（ModelOpt）原生支持** —— 在 16GB RTX 5060 Ti 上原生运行
 > [Ornith-1.5-35B-A3B-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4)
 > （W4A8 量化，256 选 8 专家，10 全注意力层 + 30 GDN/SSM 层 + 1 MTP 块）：
-> **prefill ~1300 tok/s，decode ~50 tok/s**（混合专家池：63/256 专家驻留显存 + 17.7 GiB 锁页内存）。
+> **prefill ~1300 tok/s，decode ~50 tok/s @32K ctx / ~48 tok/s @256K ctx（q4_0 KV + 48 expert slots）**
+> （混合专家池：**全部 17.67 GiB 路由专家常驻锁页 host 内存**，每层只让 7–63 / 256 个进显存
+> —— **NVFP4 不要求专家全部驻留显存**；ctx 越大留给专家池的 VRAM 越少，decode 越慢）。
 >
 > 相对上游（engine 0.1.45.3）的改动：
 > - `include/strata/core/family_layout.hpp` —— layout 校验放行 NVFP4 的 `.scale` 张量，以及 Q8_0 重打包后
@@ -219,6 +221,10 @@ More choices:
 
 - **[Swift 1.5](docs/MODELS.md#swift-15)** is a fine-tune that thinks for a shorter time before it answers, at about the same quality and RAM.
 - **[NVFP4](docs/NVFP4.md)** is NVIDIA's 4-bit version for NVIDIA cards. It needs about 80 GB of RAM to keep every expert in RAM.
+  (That figure is for the upstream Flash-Next family, whose routed experts are 63 GiB. The NVFP4 format itself does
+  not require the experts to be resident in VRAM — this fork's 35B-A3B build keeps all 17.67 GiB of routed experts in
+  **pinned host memory** and caches only 7–63 of 256 per layer in VRAM, computing the rest on a 16-thread CPU pool.
+  See [docs/strata-nvfp4-baseline.md](docs/strata-nvfp4-baseline.md).)
 - **[Qwen3.6-35B-A3B](docs/QWEN36.md)** is a smaller, different model that reads pictures and can answer several requests at once.
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** is set up by hand.
 
