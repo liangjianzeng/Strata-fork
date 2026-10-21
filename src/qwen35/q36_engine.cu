@@ -1477,6 +1477,137 @@ void expert_blob(const Layer& L, int64_t e, uint8_t* dst) {
     }
 }
 
+// ----------------------------------------------------------------------------------------- the offline expert
+// pool (--expert-pool)
+// tools/make_expert_pool.py writes the very blobs the engine builds at run time (expert_blob() above:
+// [gate | up | down | tail], in the same per-expert stride) into one file.  The engine maps that file and points
+// the hybrid pool at it: the 17.7 GiB copy out of the GGUF into pinned memory disappears, and so does the pinned
+// memory itself - the GGUF's expert pages never have to become resident.  The file describes itself, and the engine
+// refuses a pool that does not match the model it was made for (every field of every layer is compared).
+
+/// A read-only memory mapping of a file (the same shape as the GGUF reader's, so the two behave alike on Windows).
+struct MappedFile {
+    const uint8_t* base = nullptr;
+    size_t size = 0;
+#ifdef _WIN32
+    void* map = nullptr;
+    void* handle = nullptr;
+#else
+    int fd = -1;
+#endif
+    bool open(const std::string& path, std::string& err) {
+#ifdef _WIN32
+        HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) { err = "cannot open " + path; return false; }
+        LARGE_INTEGER li{};
+        GetFileSizeEx(h, &li);
+        size = (size_t) li.QuadPart;
+        HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!m) { CloseHandle(h); err = "CreateFileMapping failed for " + path; return false; }
+        base = (const uint8_t*) MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+        if (!base) { CloseHandle(m); CloseHandle(h); err = "MapViewOfFile failed for " + path; return false; }
+        map = m;
+        handle = h;
+        return true;
+#else
+        fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) { err = "cannot open " + path; return false; }
+        size = (size_t) lseek(fd, 0, SEEK_END);
+        void* p = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) { ::close(fd); fd = -1; err = "mmap failed for " + path; return false; }
+        base = (const uint8_t*) p;
+        return true;
+#endif
+    }
+    void close() {
+        if (!base) return;
+#ifdef _WIN32
+        UnmapViewOfFile(base);
+        CloseHandle((HANDLE) map);
+        CloseHandle((HANDLE) handle);
+        map = handle = nullptr;
+#else
+        munmap((void*) base, size);
+        ::close(fd);
+        fd = -1;
+#endif
+        base = nullptr;
+    }
+    ~MappedFile() { close(); }
+};
+
+struct ExpertPool {
+    struct Layer {
+        int gu_type = 0, d_type = 0;
+        uint64_t gu_row = 0, d_row = 0, up_off = 0, down_off = 0, tail_off = 0;
+        uint64_t bytes = 0, stride = 0, blob_off = 0, scale_off = 0, scale_n = 0;
+    };
+    MappedFile file;
+    std::vector<Layer> layers;
+    uint32_t n_layers = 0, n_expert = 0, n_embd = 0, n_ff = 0;
+    uint64_t n_blocks = 0;   // the blocks the pool holds (the main ones and the MTP block)
+
+    // the file is written field by field (no struct), so the layout cannot drift with the compiler's padding
+    static uint32_t u32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
+    static uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+
+    bool open(const std::string& path, std::string& err) {
+        if (!file.open(path, err)) return false;
+        const uint8_t* b = file.base;
+        if (file.size < 64) { err = "the expert pool is too small to hold a header"; return false; }
+        if (std::memcmp(b, "SQEP", 4) != 0) { err = path + " is not an expert pool (SQEP)"; return false; }
+        const uint32_t version = u32(b + 4);
+        if (version != 1) {
+            err = "the expert pool is version " + std::to_string(version) + ", this engine reads version 1";
+            return false;
+        }
+        n_layers = u32(b + 12);
+        n_expert = u32(b + 16);
+        n_embd = u32(b + 20);
+        n_ff = u32(b + 24);
+        n_blocks = u64(b + 28);
+        const uint64_t table_off = u64(b + 36), total = u64(b + 52);
+        if (total != file.size) {
+            err = "the expert pool's size field says " + std::to_string(total) + " B but the file is " +
+                  std::to_string(file.size) + " B";
+            return false;
+        }
+        if (n_layers == 0 || n_expert == 0) { err = "the expert pool has no layers or no experts"; return false; }
+        if (table_off + (uint64_t) n_layers * 88 > file.size) { err = "the expert pool's layer table runs past the file"; return false; }
+        layers.resize(n_layers);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            const uint8_t* p = b + table_off + (size_t) l * 88;
+            Layer& P = layers[l];
+            P.gu_type = (int) u32(p);
+            P.d_type = (int) u32(p + 4);
+            P.gu_row = u64(p + 8);
+            P.d_row = u64(p + 16);
+            P.up_off = u64(p + 24);
+            P.down_off = u64(p + 32);
+            P.tail_off = u64(p + 40);
+            P.bytes = u64(p + 48);
+            P.stride = u64(p + 56);
+            P.blob_off = u64(p + 64);
+            P.scale_off = u64(p + 72);
+            P.scale_n = u64(p + 80);
+            if (P.blob_off + P.stride * n_expert > file.size) {
+                err = "the expert pool's layer " + std::to_string(l) + " runs past the end of the file";
+                return false;
+            }
+            if (P.scale_off && P.scale_off + 12 * P.scale_n > file.size) {
+                err = "the expert pool's layer " + std::to_string(l) + " scales run past the end of the file";
+                return false;
+            }
+        }
+        return true;
+    }
+    /// The blob of expert e of layer l (the file holds it whole, the NVFP4 tail included)
+    const uint8_t* blob(uint32_t l, int64_t e) const {
+        return file.base + layers[l].blob_off + (size_t) e * layers[l].stride;
+    }
+};
+
 // ------------------------------------------------------------------------------------------------ the engine
 float* dalloc(size_t n) {
     float* p = nullptr;
@@ -3196,7 +3327,8 @@ struct Engine {
 /// The routed experts after the engine's buffers: all in VRAM when they fit in `vram_gib` (< 0: the free VRAM less a
 /// reserve), else the hybrid mode - every expert in host memory, the same number of VRAM slots per layer, a decode
 /// batch's other experts on the CPU pool and a prompt chunk's streamed through two staging buffers.
-bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots, std::string& err) {
+bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid_t, int slots,
+                   const ExpertPool* pool, std::string& err) {
     const auto t0 = Clock::now();
     const auto& g = m.g;
     const int64_t ne = g.n_expert;
@@ -3208,6 +3340,30 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         total += L->stride * (size_t) ne + kMmqTail;
         per_slot += L->stride;
         max_layer = std::max(max_layer, L->stride * (size_t) ne);
+    }
+    if (pool) {
+        // the pool must be this model's pool: every field of every block is compared, so a file made for another
+        // model (or another build) is refused here rather than read as garbage
+        if (pool->n_expert != (uint32_t) ne || pool->n_embd != (uint32_t) g.n_embd ||
+            pool->n_ff != (uint32_t) g.n_ff || pool->n_blocks != all.size() || pool->n_layers != all.size()) {
+            err = "the expert pool is not this model's (it holds " + std::to_string(pool->n_expert) + " experts, " +
+                  std::to_string(pool->n_embd) + " embedding, " + std::to_string(pool->n_ff) + " feed-forward, " +
+                  std::to_string(pool->n_blocks) + " blocks)";
+            return false;
+        }
+        for (size_t li = 0; li < all.size(); ++li) {
+            const Layer* L = all[li];
+            const ExpertPool::Layer& P = pool->layers[li];
+            if (P.gu_type != L->L.gu_type || P.d_type != L->L.d_type || P.gu_row != L->L.gu_row ||
+                P.d_row != L->L.d_row || P.up_off != L->L.up_off || P.down_off != L->L.down_off ||
+                P.tail_off != L->L.tail_off || P.bytes != L->L.bytes || P.stride != L->stride) {
+                err = "the expert pool's block " + std::to_string(li) + " does not match the model's expert layout";
+                return false;
+            }
+        }
+        std::fprintf(stderr, "strata-q36: the expert pool mapped (%.2f GiB, %u blocks, %u experts): the blobs are read "
+                     "from the file, with no host copy\n", (double) pool->file.size / (1 << 30), pool->n_layers,
+                     pool->n_expert);
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
@@ -3295,14 +3451,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         }
     }
     if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
-        std::vector<uint8_t> blob;
-        for (Layer* L : all) {
+        for (size_t li = 0; li < all.size(); ++li) {
+            Layer* L = all[li];
             CK(cudaMalloc(&L->blobs, L->stride * (size_t) ne + kMmqTail));
             CK(cudaMemset(L->blobs, 0, L->stride * (size_t) ne + kMmqTail));
-            blob.assign(L->L.bytes, 0);
-            for (int64_t e = 0; e < ne; ++e) {
-                expert_blob(*L, e, blob.data());
-                CK(cudaMemcpy(L->blobs + (size_t) e * L->stride, blob.data(), L->L.bytes, cudaMemcpyHostToDevice));
+            if (pool) {
+                // the pool file already holds the blobs: the whole layer in one copy
+                CK(cudaMemcpy(L->blobs, pool->blob((uint32_t) li, 0), L->stride * (size_t) ne, cudaMemcpyHostToDevice));
+            } else {
+                std::vector<uint8_t> blob;
+                blob.assign(L->L.bytes, 0);
+                for (int64_t e = 0; e < ne; ++e) {
+                    expert_blob(*L, e, blob.data());
+                    CK(cudaMemcpy(L->blobs + (size_t) e * L->stride, blob.data(), L->L.bytes, cudaMemcpyHostToDevice));
+                }
             }
             L->n_slots = (int) ne;
         }
@@ -3349,18 +3511,22 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             return false;
         }
     }
-    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+    // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies).
+    // With --expert-pool there is no host copy at all: the pool file holds the blobs and the engine points at them.
     size_t host = 0;
     for (Layer* L : all)
         if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
-        (void) cudaGetLastError();
-        arena = (uint8_t*) std::malloc(host);
-        if (!arena) {
-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-            return false;
+    bool pinned = false;
+    if (!pool) {
+        pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+        if (!pinned) {
+            (void) cudaGetLastError();
+            arena = (uint8_t*) std::malloc(host);
+            if (!arena) {
+                err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+                return false;
+            }
         }
     }
     size_t off = 0;
@@ -3370,18 +3536,27 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         if (mtp_only && &L != &m.mtp) {   // a main layer: every expert in VRAM, as in the all-in-VRAM placement
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) ne + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ne + kMmqTail));
-            std::vector<uint8_t> blob(L.L.bytes, 0);
-            for (int64_t e = 0; e < ne; ++e) {
-                expert_blob(L, e, blob.data());
-                CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+            if (pool) {
+                CK(cudaMemcpy(L.blobs, pool->blob((uint32_t) li, 0), L.stride * (size_t) ne, cudaMemcpyHostToDevice));
+            } else {
+                std::vector<uint8_t> blob(L.L.bytes, 0);
+                for (int64_t e = 0; e < ne; ++e) {
+                    expert_blob(L, e, blob.data());
+                    CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
             }
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        if (pool) {
+            // the pool file's own bytes: no copy, no pinned memory, and the GGUF's expert pages stay out of RAM
+            L.hblobs = (uint8_t*) pool->blob((uint32_t) li, 0);
+        } else {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        }
         L.n_slots = S;
         if (S > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
@@ -3430,12 +3605,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
                      "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
                      (long long) ne);
-    else
-    std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
-                 "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
+    else {
+    const char* where = pool ? "the mapped pool file" : (pinned ? "pinned host memory" : "pageable host memory");
+    std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s, "
+                 "the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
                  "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
-                 pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
+                 where, E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+    }
     return true;
 #endif
 }
@@ -4165,7 +4342,7 @@ int serve(Engine& E) {
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file;
+    std::string model, tokens, force, dump_full, emb_file, expert_pool_path;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     int kvm = 0;   // --kv: 0 fp16(F32) / 1 int8 / 2 q4_0 / 3 k8v4 / 4 q8_0
     double expert_vram = -1.0;
@@ -4217,6 +4394,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
+        else if (a == "--expert-pool") expert_pool_path = next();   // the offline expert pool (tools/make_expert_pool.py)
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
@@ -4301,7 +4479,18 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     E.kvm = kvm;
     E.init(m, ctx, chunk, batch, vision);
-    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
+    // the offline expert pool (--expert-pool): the blobs come from the file, so the engine neither copies them out of
+    // the GGUF nor pins them in host memory
+    ExpertPool pool;
+    const ExpertPool* pool_ptr = nullptr;
+    if (!expert_pool_path.empty()) {
+        if (!pool.open(expert_pool_path, err)) {
+            std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+            return 1;
+        }
+        pool_ptr = &pool;
+    }
+    if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, pool_ptr, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
