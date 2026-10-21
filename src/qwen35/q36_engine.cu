@@ -1488,6 +1488,7 @@ struct Engine {
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
+    float* d_tails = nullptr;   // [layers][n_expert][4] the NVFP4 weight_scale_2 {s_gate, s_up, s_down, 0}, device
     __half* x16 = nullptr;
     bool use_graph = true;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
@@ -1694,6 +1695,25 @@ struct Engine {
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
             mq_gu = dalloc((size_t) ne * 2 * FF);
             mq_h = dalloc((size_t) ne * FF);
+            bool any_tail = m->has_mtp && m->mtp.L.tail_off != 0;
+            for (const Layer& L : m->layers) any_tail = any_tail || L.L.tail_off != 0;
+            if (any_tail) {
+                // NVFP4: the MMQ products carry the per-block scales only - the per-expert weight_scale_2 (the blob
+                // tail's {s_gate, s_up, s_down}) must be applied to the gate / up / down rows afterwards
+                const size_t nl = m->layers.size() + (m->has_mtp ? 1 : 0);
+                std::vector<float> tails((size_t) g.n_expert * 4 * nl, 1.0f);
+                for (size_t l = 0; l < nl; ++l) {
+                    const Layer& L = l < m->layers.size() ? m->layers[l] : m->mtp;
+                    float* t = tails.data() + l * (size_t) g.n_expert * 4;
+                    for (int64_t e = 0; e < (int64_t) g.n_expert; ++e) {
+                        t[e * 4] = L.s_gate ? L.s_gate[e] : 1.0f;
+                        t[e * 4 + 1] = L.s_up ? L.s_up[e] : 1.0f;
+                        t[e * 4 + 2] = L.s_down ? L.s_down[e] : 1.0f;
+                    }
+                }
+                d_tails = dalloc((size_t) g.n_expert * 4 * nl);
+                CK(cudaMemcpy(d_tails, tails.data(), tails.size() * sizeof(float), cudaMemcpyHostToDevice));
+            }
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
@@ -2339,6 +2359,9 @@ struct Engine {
             gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
             gu.dst = mq_gu; gu.ld_dst = 2 * FF;
             mctx->run(gu, st);
+            if (L.L.tail_off)   // NVFP4: s_gate on the gate half, s_up on the up half, before the SwiGLU
+                MMQ::scale_gu_rows(mq_gu, 2 * (int64_t) FF, FF, rbounds, (int) g.n_expert,
+                                   d_tails + (size_t) li * (size_t) g.n_expert * 4, 0, n_ent, st);
             MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
             MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
             MMQ::Product dn;
@@ -2346,6 +2369,9 @@ struct Engine {
             dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
             dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
             mctx->run(dn, st);
+            if (L.L.tail_off)   // NVFP4: s_down on the down products, in place (the combine reads them through rinv)
+                MMQ::scale_down_rows(eparts, N, rbounds, (int) g.n_expert,
+                                     d_tails + (size_t) li * (size_t) g.n_expert * 4, n_ent, st);
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
@@ -2373,6 +2399,15 @@ struct Engine {
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
+        if (T > kGemmT && std::getenv("STRATA_Q36_DEBUG_MAX")) {
+            static std::vector<float> dbg;
+            dbg.resize((size_t) T * N);
+            CK(cudaStreamSynchronize(st));
+            CK(cudaMemcpy(dbg.data(), x, dbg.size() * 4, cudaMemcpyDeviceToHost));
+            float mx = 0.f, mn = 0.f;
+            for (float v : dbg) { mx = std::fmax(mx, v); mn = std::fmin(mn, v); }
+            std::fprintf(stderr, "DBG layer %2zu T %4d p0 %6lld max|x| %12.5g min %12.5g\n", li, T, (long long) p0, mx, mn);
+        }
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
