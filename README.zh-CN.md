@@ -11,10 +11,27 @@
 > - `src/qwen35/q36_engine.cu` —— ① 路由专家：加载时从 F32 `ffn_{gate,up,down}_exps.scale` 张量读取
 >   per-expert `weight_scale_2`，填入专家 blob 尾包 `{s_gate, s_up, s_down, 0}`；② ModelOpt 的 lm_head
 >   （`output.weight`，同为 NVFP4）在加载时由 host 一次性 dequant + 重量化为 Q8_0（约 1 秒，515 MiB），
->   完全复用现有 MMVQ 路径；③ **新增 `--kv fp16|int8|q4_0|k8v4`**：q36 的 KV cache 原本只有 F32 池
->   （40 KiB/cell），现支持 int8（codes + 每 64 值一个 fp16 scale，528 B/cell）与 GGML q4_0（288 B/cell）
->   存储，写入侧量化、decode/prefill 读取侧反量化，与 QSA 层的 `kv_q8`/`kv_q4` 格式一致。实测四模式
->   prefill/decode 速度与 F32 持平（零损失），int8/q4_0 下 256K ctx 的 KV 仅 ~2.6 GiB / ~1.4 GiB。
+>   完全复用现有 MMVQ 路径；③ **新增 `--kv fp16|int8|q4_0|k8v4|q8_0`**：q36 的 KV cache 原本只有 F32 池，
+>   现支持 int8（codes + 每 64 值一个 fp16 scale）、GGML q4_0、GGML q8_0（32 codes + 每 32 值一个
+>   fp16 scale）与 k8v4 存储，写入侧量化、decode/prefill 读取侧反量化，与 QSA 层的 `kv_q8`/`kv_q4`
+>   格式一致。每 token 的 KV 占用（11 个带 KV 的层 = 10 全注意力 + MTP，2 个 KV 头，HD=256）：
+>   **F32 44 KiB · q8_0 11.7 KiB · int8 11.3 KiB · k8v4 8.0 KiB · q4_0 6.2 KiB** —— 五档 prefill/decode
+>   速度与 F32 持平（零损失），256K ctx 的 KV 仅 ~2.84 GiB（int8）/ ~2.92 GiB（q8_0）/ ~1.55 GiB（q4_0）。
+>
+> 修复的引擎缺陷（相对上游 0.1.45.3）：
+> - **F32 KV 缓存少分配 4 倍**（`kv_half_bytes()` 缺 F32 分支，误用 int8 的 264 B/half，而内核按
+>   1024 B/half 读写）：第 2 个及之后的 KV 头写越界，ctx=32768 时恰好砸中第 4 层的 GDN 状态
+>   （`kc[3] + (1*ctx+4096)*HD == S[4]`）→ **超过 4096 token 的长 prompt 输出乱码**。一行修复。
+> - **NVFP4 尾包 scale 丢失**：MMQ 乘积只带 per-block scale，per-expert `weight_scale_2`
+>   （`{s_gate, s_up, s_down}`）从未施加 → 路由专家的 gate/up/down 量级全错。现于 SwiGLU 与 combine 前
+>   分别施加。
+> - **int8 布局的会话拷贝错误**：`copy_session()` 按「每 head 的 cell 连续」做一次 `cudaMemcpy2D`，
+>   而 int8 布局是平面的（codes 区与 scales 区分离）→ 批处理路径下会话状态静默拷错字节。
+>   改为 codes / scales 两段拷贝。
+>
+> 验证：跨 4096 边界的 5 个用例全部 20/20 复现文档自身续写；30K token prompt 上 F32 / int8 / q4_0 /
+> k8v4 / q8_0 **逐 token 相同**；生产服务（256K ctx + q8_0）在 **208,837 token** 的上下文里，
+> 首/中/尾三处埋点全部命中、零乱码。
 >
 > 模型转换链：HF NVFP4 safetensors → `convert_hf_to_gguf.py`（NVFP4 repack）→ 共享专家 / dense / MTP BF16
 > 张量重铸为 Q8_0，120 个路由专家保留 NVFP4 + `.scale`（20.4 GB GGUF）。基线测试报告见
