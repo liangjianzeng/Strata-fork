@@ -345,3 +345,54 @@ WDDM 下 `nvidia-smi` 只报物理 VRAM 且饱和后失真：生产跑满时它�
 - 调试脚本留存 `D:\MyLLM\_tmp_code\`（`midcmp.py`/`lycmp.py`/`l3stage.py`/`kvmatch.py` 复现定位链，
   `reg.py`/`kvreg.py`/`kvq8.py`/`kvlong2.py` 回归，`qcheck.py`/`ctxladder2.py` 长上下文验收）。
 
+
+---
+
+## 离线专家池 `--expert-pool`（2026-10-21 16:00）
+
+### 动机
+
+hybrid 模式下引擎把**全部路由专家**以 native blob `[gate | up | down | tail]` 的形式放进 host 内存，
+每次启动都重做一遍：从 mmap 的 GGUF 里逐专家 memcpy 进一块 `cudaHostAlloc` 的锁页 arena。
+- **拷贝成本 = 45.7 s**（与生产并发时 96.6 s）
+- **锁页内存 17.67 GiB**，叠在 GGUF 自身的 page cache 之上 ⇒ 48 GB 机器上逼近换页
+
+`tools/make_expert_pool.py` 把这件事搬到离线做一次，产出一个文件；`--expert-pool` 让引擎 mmap 它，
+把 host 池直接指过去 ⇒ **零拷贝、零锁页内存、GGUF 的专家页不再进 RAM**。
+
+### 文件格式（自描述）
+
+```
+header  64 B   magic "SQEP" | version | flags | n_blocks | n_expert | n_embd | n_ff
+                 | n_blocks(u64) | table_off | data_off | total_bytes
+table   88 B/块  gu_type | d_type | gu_row | d_row | up_off | down_off | tail_off
+                 | bytes | stride | blob_off | scale_off | scale_n
+data            每块每专家一个 blob（bytes 有效，stride 对齐的填充为 0）+ 每块 3×n_expert 个 F32 scale
+```
+
+blob 布局**就是引擎自己的**：`expert_blob()` 的 `[gate|up|down|tail]` + `native_expert_layout()` 的 stride，
+NVFP4 tail 是 `{s_gate, s_up, s_down, 0}`。引擎在读第一个字节前，把文件里**每块每个字段**与模型自身
+算出的布局逐项比对，不符即拒（不会读成垃圾）。
+
+### 本模型的精确几何
+
+| 项 | 值 |
+|---|---|
+| NVFP4 (type 40) | **36 B / 64 值** = 4 × UE4M3 sub-block scale + 32 B E2M1 codes（bpr = 0.5625） |
+| 主块专家 blob | `bytes = 1,769,488`，`stride = 1,769,616`（`al = lcm(36,16) = 144`） |
+| MTP 块专家（Q8_0） | `bytes = stride = 3,342,336`（`al = lcm(34,16) = 272`，整除） |
+| 合计 | 40 主块 × 256 + 1 MTP 块 × 256 = **17.67 GiB**（与引擎实测的池大小精确一致） |
+
+GGUF 里专家张量的排列：`blk.N.ffn_{gate,up,down}_exps.weight` 的 ne 是 `[in, out, experts]`
+（专家在最慢维 ⇒ 专家 e 的字节连续），MTP 块是 2D 展平 `[in, out×experts]`（同样连续）。
+
+### 验证
+
+`tools/verify_expert_pool.py` **独立**从 GGUF 重建 blob 再与文件比对（不复用写入器的代码路径）：
+**10,496 个专家 blob（41 块 × 256）逐字节一致，0 差异**。
+
+### 待办
+
+- **端到端验证未做**（10-21 16:00 时 8090 被另一会话的 `llama-server.exe` 占满 16024/16311 MiB）：
+  需实测 ① 启动时间 ② 输出与无池路径逐 token 相同 ③ CPU 补算速度（mmap 页 vs 锁页内存的差异）。
+- 未上生产：`strata-ornith-nvfp4-8090.json` 暂未加 `--expert-pool`。
