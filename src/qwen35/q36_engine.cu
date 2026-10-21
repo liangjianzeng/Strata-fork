@@ -335,7 +335,9 @@ static_assert(sizeof(KvBlkQ4) == 18, "q4_0 block layout");
 /// Bytes of one cell (one token) of one KV head's K or V in mode `kvm`.
 static inline size_t kv_half_bytes(int kvm, bool is_v, int hd) {
     const bool q4 = kvm == 2 || (kvm == 3 && is_v);
-    return q4 ? (size_t) hd / 32 * 18 : (size_t) hd + (size_t) hd / 64 * 2;
+    if (q4) return (size_t) hd / 32 * 18;
+    if (kvm == 0) return (size_t) hd * 4;   // F32 (was falling into the int8 branch: the cache was 4x too small and
+    return (size_t) hd + (size_t) hd / 64 * 2;   // every kh >= 1 write stomped neighboring allocations)
 }
 
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
