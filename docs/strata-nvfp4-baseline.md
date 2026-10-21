@@ -167,6 +167,107 @@ hybrid experts: 63 of 256 per layer in VRAM (4.35 GiB), all 17.67 GiB pinned hos
   压出来的显存换成专家驻留，命中率上去后 decode 才回来。
 - ⚠️ llama.cpp+DFlash 的 45.7–67 t/s 是在 **96K ctx** 下测的，与本表 256K 档**不构成同档对比**。
 
+### 双槽（`--batch 2`）并发与「1 GiB 显存留量」之谜（2026-10-21 晚）
+
+`--batch N` 让引擎同时解码 N 路会话，**每路一份完整 KV，不共享不分片**
+（`q36_engine.cu:1833` 的 `per = kv_half_bytes(...) × n_head_kv × ctx × n_attn`，`:1842` 硬检查
+`per × n_sess + 1 GiB > fr0` 直接 `exit(1)`）。与 llama.cpp 的 `--parallel`（`kv_unified` 或槽内分片）语义完全不同。
+
+**双槽 200K 的槽数上限**（每槽 70.7 MiB，`need > fr` 是 `cudaMemGetInfo` 实测空闲，非保守估计）：
+
+| 配置 | 结果 | 引擎原文 |
+|---|---|---|
+| 双槽 200K + 48 槽（归还 packed 前） | **崩** | `5153 MiB needed, 4640 MiB free` |
+| 双槽 200K + 41 槽 | **崩** | `4658 MiB needed, 4640 MiB free`（差 18 MiB） |
+| 双槽 200K + 40 槽 | 过（余 53 MiB） | 40 槽曾是硬上限 |
+| **双槽 200K + 48 槽（归还 packed 后）** | **过（余 767 MiB）** | 60.5 t/s，GPU 命中率 19.9% |
+
+#### 那 1 GiB 到底被谁占了
+
+**不是留给桌面的。** 空载实测独显占用 **0 MiB**（16311 total / 0 used）—— 桌面合成与唯一输出都在核显。
+
+16GB 卡的完整账本（双槽 200K / 48 槽，引擎自报）：
+
+| 项 | 大小 | 说明 |
+|---|---|---|
+| 权重 dense | 4.34 GiB | 路由专家留在 host |
+| **packed Q8_0 decode 副本** | **1.28 GiB** | **混合专家模式下白占**（见下） |
+| KV 两路 × 1.27 GiB | 2.53 GiB | q4_0，6.50 KiB/token（引擎实测反解） |
+| 专家槽 48 × 70.7 MiB | 3.31 GiB | 每层 48/256 驻留 |
+| prompt chunk staging | 1.59 GiB | 2 × (max_layer + tail) |
+| 引擎固定缓冲（att scores / CUDA ctx） | ~2.87 GiB | 真实工作缓冲 |
+| `fr` = 分配专家池前的实测空闲 | 4.53 GiB | 与 40 槽的 `need` 4587 MiB 对上 |
+
+引擎源码里三处「留量」，只有一处是真给别人的：
+
+1. `reserve = 768 MiB`（`:3214`）—— **只在自动算槽路径生效**，显式 `--expert-slots` 时不参与计算，
+   它的用途是防驱动抖动，不是给别的程序用。
+2. `:1842` 多会话硬检查的 **1 GiB 安全垫**（`per × n_sess + 1 GiB > fr0`）—— 双槽专属。
+3. `:3300` 的 256/512 MiB 缓冲余量 —— 真实工作缓冲，不能动。
+
+#### 真正的浪费：packed Q8_0 decode 副本 1.28 GiB
+
+混合专家模式把全部路由专家放在锁页 host 内存、只让热专家进 VRAM 槽，
+**这些 dense decode 副本在 hybrid 路径上根本没人读**。引擎本来就有「归还副本」的代码
+（`:3227-3241`），但门禁是 `slots <= 0`（仅自动算槽模式）⇒ 显式指定槽数时这 1.28 GiB 一直白占。
+
+**改动**（commit `4ed69349`）：显式 `--expert-slots N` 时，若「保留副本装不下、归还后装得下」，
+就归还副本 —— 空闲从 4640 升到 5920 MiB，48 槽直接过。
+
+**代价与验证**：decode 改读 GGUF 布局（上游文档：bitwise 相同、略慢）。实测同一 prompt 走
+`--serve` 协议、48 槽 160K 双槽，**保留 vs 归还产出完全相同的 24 个 token id**，
+且归还组不更慢（55.1 vs 53.3 t/s）⇒ 多出的 8 个专家槽收益 > 副本损失。
+
+| 档位 | decode | GPU 命中率 |
+|---|---|---|
+| 双槽 200K + 40 槽（保留副本，旧上限） | 56.5 t/s | — |
+| **双槽 200K + 48 槽（归还副本，当前生产档）** | **60.5 t/s** | **19.9%** |
+
+环境变量：`STRATA_Q36_KEEP_PACKED=1` 保留副本、拒绝交易；`STRATA_Q36_GIVE_PACKED=1` 强制归还（对比两条 decode 路径用）。
+
+#### ⚠️ 术语澄清：Strata 语境下有两个「pack」，不是一回事
+
+「packed」这个词在 Strata 里有**两个完全不同的所指**，混起来会得出错误结论
+（比如「Qwen3.5-35B 官方没有 NVFP4 pack，所以专家卸载机制用不上」——这个判断对 pack 而言正确，但对我们这份模型**不构成问题**，见下）。
+
+| | **A · 专家 pack** | **B · Q8_0 dense decode 副本** |
+|---|---|---|
+| 是什么 | 243 个 `type 40`（NVFP4）张量：`blk.N.ffn_{gate,up,down}_exps.weight` | 154 个 **dense** Q8_0 张量的第二份拷贝：`attn_qkv`(n_out=8192, 41 个)、`attn_gate`(4096, 30 个)、`ffn_*_shexp`(2048, 83 个) |
+| 干什么用 | **专家卸载机制的前提** —— 专家能按层拆开搬进 VRAM 槽，未驻留的走 CPU pool 补算 | 只服务 attention 与 shared expert 的 decode，走 `q8_packed_mmvq()` 快速路径 |
+| 显存 | 就是路由专家本体的 17.67 GiB（锁页 host 内存 + 每层驻留槽） | **额外 1.28 GiB**（GGUF 原版已另有一份在显存） |
+| 官方 35B 有吗 | **没有**。Strata 官方只给 **Qwen3.8-Flash-Next** 出了 NVFP4 pack；Qwen3.5-35B 无 | 不涉及模型版本，是引擎特性 |
+
+**结论：官方没有 35B 的 NVFP4 pack ⇒ 「packed NVFP4」这个说法对本模型不成立；
+但这不影响专家卸载机制 —— 因为我们手里本来就有 pack 形态的权重。**
+
+我们这份 `Ornith-1.5-35B-A3B-NVFP4-q36.gguf`（21.9 GB）**不是官方产物**，是从
+`models/ornith-nvfp4/`（HF safetensors + `hf_quant_config.json`，ModelOpt W4A8）**自行转换**出来的：
+`convert_hf_to_gguf.py`（NVFP4 repack）→ `fix_router_shape.py` → `make_q36_gguf.py`（Strata q36 定制）。
+转换链产出的就是「专家 NVFP4 + dense Q8_0」两段式布局，**A 种 pack 形态天然具备**。
+
+> 另有 `Ornith-1.5-35B-A3B-NVFP4.gguf`（23.85 GB，10-20）是另一份文件，不是生产档用的那份。
+
+GGUF 张量类型直方图（自写解析器，994 个张量）：
+`551 F32 + 321 Q8_0 + 121 type 40 (NVFP4) + 1 BF16`。
+其中 157 个 Q8_0 满足 packed 形状门槛（`n_in % 32 == 0 && n_out >= 2048`，`native_mmvq.cu:2048`），
+**且全部是 dense 张量** ⇒ 引擎建出来的 B 副本只覆盖 attention + shared expert，**一个路由专家都没碰**。
+
+**B 副本为何会被建**：`q36_engine.cu:4238` 一句 `setenv("STRATA_Q8_PACKED", "1", 0)`
+把它**默认强制打开**（`native_q8_0_packed_enabled()` 返回 `enabled || q8_sm60_on()`），
+`q36_engine.cu:1315` 据此建副本，`native_mmvq.cu:2053` 在 registry 非空时走 packed 路径。
+**这 1.28 GiB 与我们改动前的专家卸载机制完全无关** —— 17.67 GiB 路由专家仍全在锁页 host 内存，
+每层 48/256 进显存槽，命中率 19.9%–24.5% 未受任何影响。
+
+#### ⚠️ 判显存余量只能看 Task Manager，不能看 nvidia-smi
+
+WDDM 下 `nvidia-smi` 只报物理 VRAM 且饱和后失真：生产跑满时它报 **4068 MiB used / 11983 free**，
+而 Task Manager 同时显示**专用 15.0/16.0 GB** + **共享 17.9/31.4 GB**。共享那栏是
+17.67 GiB 锁页专家池经 PCIe 被 GPU 访问（不是溢出）。
+
+**共享显存兜底不免费**：同一配置（40 槽 / 200K）专家池放置耗时 **独占 45.7 s vs 与生产并发 96.6 s（慢 2.1 倍）**，
+且**探针会把生产引擎挤到 `exit 1`**（服务层 HTTP 已 ready，但引擎懒启动失败 ⇒ 请求返回 503）。
+⇒ **探针与生产服务必须互斥，跑探针前先停生产。**
+
 ### 专家扩容实测（2026-10-21，256K ctx，`--bench-pp 2048 --bench-tg 128`）
 
 在 16GB 卡上，decode 的瓶颈不是算力而是**每 token 要从锁页 host 内存搬多少专家权重**。
