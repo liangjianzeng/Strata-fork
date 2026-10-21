@@ -3053,11 +3053,23 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, st));
             }
             if (a.kc[l] && a.pos > 0) {
-                const size_t kb = kv_half_bytes(kvm, false, g.head_dim), vb = kv_half_bytes(kvm, true, g.head_dim);
-                CK(cudaMemcpy2DAsync(b.kc[l], (size_t) ctx * kb, a.kc[l], (size_t) ctx * kb, (size_t) a.pos * kb,
-                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
-                CK(cudaMemcpy2DAsync(b.vc[l], (size_t) ctx * vb, a.vc[l], (size_t) ctx * vb, (size_t) a.pos * vb,
-                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                // A KV half is either per cell (F32 / q4_0 / q8_0: every head's cells are one contiguous run) or planar
+                // (int8: the codes of every cell, then the scales of every cell - two runs per head)
+                const size_t HD = (size_t) g.head_dim, HKV = (size_t) g.n_head_kv, ncell = (size_t) a.pos;
+                auto copy_half = [&](float* dst, const float* src, bool is_v) {
+                    const int mode = (kvm == 3 && is_v) ? 2 : kvm;   // k8v4's V is q4_0
+                    if (mode == 1) {   // int8: the codes, then the scales
+                        CK(cudaMemcpy2DAsync(dst, ctx * HD, src, ctx * HD, ncell * HD, HKV, cudaMemcpyDeviceToDevice, st));
+                        CK(cudaMemcpy2DAsync((float*) ((uint8_t*) dst + HKV * ctx * HD), ctx * (HD / 64) * 2,
+                                             (const float*) ((const uint8_t*) src + HKV * ctx * HD), ctx * (HD / 64) * 2,
+                                             ncell * (HD / 64) * 2, HKV, cudaMemcpyDeviceToDevice, st));
+                    } else {   // per cell: one contiguous run of cells per head
+                        const size_t hb = kv_half_bytes(mode, is_v, g.head_dim);
+                        CK(cudaMemcpy2DAsync(dst, ctx * hb, src, ctx * hb, ncell * hb, HKV, cudaMemcpyDeviceToDevice, st));
+                    }
+                };
+                copy_half(b.kc[l], a.kc[l], false);
+                copy_half(b.vc[l], a.vc[l], true);
             }
         }
         CK(cudaMemcpyAsync(b.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
