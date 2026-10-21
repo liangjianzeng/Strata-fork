@@ -321,7 +321,8 @@ struct RowSel {
 };
 
 // ---- quantized KV storage (--kv): 0 = the F32 pools (as before), 1 = int8 codes + one fp16 scale per 64 values,
-// 2 = ggml q4_0 (18 B per 32 values), 3 = k8v4 (K as int8, V as q4_0).  The same formats as the QSA layers'
+// 2 = ggml q4_0 (18 B per 32 values), 3 = k8v4 (K as int8, V as q4_0), 4 = ggml q8_0 (34 B per 32 values).
+// The same formats as the QSA layers'
 // kv_q8 / kv_q4:  scale = fp16(max|x| / 127), code = clamp(rint(x / scale), -127, 127);  q4_0: d = mval / -8,
 // q = clamp(trunc(x / d + 8.5), 0, 15), element t < 16 in the low nibble, t + 16 in the high one.  The pools
 // stay `float*` on the host side and are read as bytes in the kernels.
@@ -331,9 +332,15 @@ struct KvBlkQ4 {   // ggml block_q4_0
     uint16_t d;
     uint8_t qs[16];
 };
+struct KvBlkQ8 {   // ggml block_q8_0: 32 int8 codes + one fp16 scale
+    uint16_t d;
+    int8_t qs[32];
+};
+static_assert(sizeof(KvBlkQ8) == 34, "q8_0 block layout");
 static_assert(sizeof(KvBlkQ4) == 18, "q4_0 block layout");
 /// Bytes of one cell (one token) of one KV head's K or V in mode `kvm`.
 static inline size_t kv_half_bytes(int kvm, bool is_v, int hd) {
+    if (kvm == 4) return (size_t) hd / 32 * 34;   // q8_0 (34 B per 32 values)
     const bool q4 = kvm == 2 || (kvm == 3 && is_v);
     if (q4) return (size_t) hd / 32 * 18;
     if (kvm == 0) return (size_t) hd * 4;   // F32 (was falling into the int8 branch: the cache was 4x too small and
@@ -409,6 +416,20 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
             kq[cell * HD + i] = (int8_t) c8;
             if ((i & 63) == 0) ksc[cell * (HD / 64) + g] = sb;
             __syncthreads();
+        } else if (kvm == 4) {   // K as q8_0 (32 codes + one fp16 scale per block, one warp per block)
+            const int b = i >> 5, lane = i & 31;
+            float amax = fabsf(v);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const uint16_t sb = kv_f16_bits(amax / 127.0f);
+            const float sf = kv_f32_bits(sb);
+            int q = sf > 0.f ? __float2int_rn(v / sf) : 0;
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            KvBlkQ8* kb = (KvBlkQ8*) kc;
+            const size_t cell = (size_t) kh * ctx + pos;
+            KvBlkQ8& blk = kb[cell * (HD / 32) + b];
+            if (lane == 0) blk.d = sb;
+            blk.qs[lane] = (int8_t) q;
         } else {   // K as q4_0 (kvm 2 or 3)
             const int b = i >> 5, lane = i & 31;
             float amax = fabsf(v), mval = v;
@@ -430,7 +451,21 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
             if (lane < 16) blk.qs[lane] = (uint8_t) (qc | (qhi << 4));
             __syncthreads();
         }
-        if (kvm == 2 || kvm == 3) {   // V as q4_0
+        if (kvm == 4) {   // V as q8_0 (32 codes + one fp16 scale per block, one warp per block)
+            const int b = i >> 5, lane = i & 31;
+            float amax = fabsf(kv);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            const uint16_t sb = kv_f16_bits(amax / 127.0f);
+            const float sf = kv_f32_bits(sb);
+            int q = sf > 0.f ? __float2int_rn(kv / sf) : 0;
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            KvBlkQ8* vb = (KvBlkQ8*) vc;
+            const size_t cell = (size_t) kh * ctx + pos;
+            KvBlkQ8& blk = vb[cell * (HD / 32) + b];
+            if (lane == 0) blk.d = sb;
+            blk.qs[lane] = (int8_t) q;
+        } else if (kvm == 2 || kvm == 3) {   // V as q4_0
             const int b = i >> 5, lane = i & 31;
             float amax = fabsf(kv), mval = kv;
 #pragma unroll
@@ -517,6 +552,14 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
                 a += qs[u] * ((float) (nib - 8) * kv_f32_bits(blk.d));
             }
             s = a * scale;
+        } else if (kvm == 4) {   // K as q8_0 (32 codes + one fp16 scale per block)
+            const KvBlkQ8* kb = (const KvBlkQ8*) ((const uint8_t*) kc + cell * (size_t) (HD / 32) * 34);
+#pragma unroll 4
+            for (int u = 0; u < HD; ++u) {
+                const KvBlkQ8& blk = kb[u >> 5];
+                a += qs[u] * ((float) blk.qs[u & 31] * kv_f32_bits(blk.d));
+            }
+            s = a * scale;
         } else {   // kvm == 0: the F32 pools
             const float* kp = kc + cell * HD;
             for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
@@ -529,7 +572,13 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
     const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
     float acc = 0.f;
-    if (kvm == 1) {   // V as int8
+    if (kvm == 4) {   // V as q8_0 (32 codes + one fp16 scale per block)
+        const KvBlkQ8* vb = (const KvBlkQ8*) vc;
+        for (int k = 0; k < n; ++k) {
+            const KvBlkQ8& blk = vb[(size_t) (kvh * ctx + p0 + k) * (HD / 32) + (j >> 5)];
+            acc += sc[k] * ((float) blk.qs[j & 31] * kv_f32_bits(blk.d));
+        }
+    } else if (kvm == 1) {   // V as int8
         const int8_t* vc8 = (const int8_t*) vc;
         const uint16_t* vsc = (const uint16_t*) (vc8 + (size_t) HKV * ctx * HD);
         for (int k = 0; k < n; ++k) {
@@ -653,7 +702,10 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
     const int64_t kvh = i / per, rest = i % per;
     const size_t cell = (size_t) kvh * ctx + rest / HD;
     const int d = (int) (rest % HD);
-    if (kvm == 1 || kvm == 3) {   // int8 K / V (kvm 3's V is q4_0 below)
+    if (kvm == 4) {   // q8_0 K (32 codes + one fp16 scale per block)
+        const KvBlkQ8* blk = (const KvBlkQ8*) ((const uint8_t*) kc + cell * (size_t) (HD / 32) * 34) + d / 32;
+        k16[i] = __float2half((float) blk->qs[d % 32] * kv_f32_bits(blk->d));
+    } else if (kvm == 1 || kvm == 3) {   // int8 K / V (kvm 3's V is q4_0 below)
         const int8_t* kc8 = (const int8_t*) kc;
         const uint16_t* ksc = (const uint16_t*) (kc8 + (size_t) HKV * ctx * HD);
         k16[i] = __float2half((float) kc8[cell * HD + d] * kv_f32_bits(ksc[cell * (HD / 64) + d / 64]));
@@ -666,7 +718,10 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
     } else {
         k16[i] = __float2half(kc[(size_t) kvh * ctx * HD + rest]);
     }
-    if (kvm == 1) {
+    if (kvm == 4) {   // q8_0 V
+        const KvBlkQ8* blk = (const KvBlkQ8*) ((const uint8_t*) vc + cell * (size_t) (HD / 32) * 34) + d / 32;
+        v16[i] = __float2half((float) blk->qs[d % 32] * kv_f32_bits(blk->d));
+    } else if (kvm == 1) {
         const int8_t* vc8 = (const int8_t*) vc;
         const uint16_t* vsc = (const uint16_t*) (vc8 + (size_t) HKV * ctx * HD);
         v16[i] = __float2half((float) vc8[cell * HD + d] * kv_f32_bits(vsc[cell * (HD / 64) + d / 64]));
@@ -1508,7 +1563,7 @@ struct Engine {
     };
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
-    int kvm = 0;   // the KV storage mode (--kv): 0 F32, 1 int8, 2 q4_0, 3 k8v4 (set before init())
+    int kvm = 0;   // the KV storage mode (--kv): 0 F32, 1 int8, 2 q4_0, 3 k8v4, 4 q8_0 (set before init())
     uint64_t use_clock = 0;
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
     float **d_conv_tab = nullptr, **d_S_tab = nullptr, **d_kc_tab = nullptr, **d_vc_tab = nullptr;
@@ -4071,7 +4126,7 @@ int serve(Engine& E) {
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
-    int kvm = 0;   // --kv: 0 fp16(F32) / 1 int8 / 2 q4_0 / 3 k8v4
+    int kvm = 0;   // --kv: 0 fp16(F32) / 1 int8 / 2 q4_0 / 3 k8v4 / 4 q8_0
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
@@ -4091,10 +4146,10 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
-        else if (a == "--kv") {   // the KV storage: fp16 = the engine's F32 pools (as before), int8 / q4_0 / k8v4 quantized
+        else if (a == "--kv") {   // the KV storage: fp16 = the engine's F32 pools (as before), int8 / q4_0 / k8v4 / q8_0 quantized
             const std::string v = next();
-            kvm = v == "int8" ? 1 : v == "q4_0" ? 2 : v == "k8v4" ? 3 : 0;
-            if (kvm == 0 && v != "fp16") std::fprintf(stderr, "strata-q36: unknown --kv %s (fp16|int8|q4_0|k8v4), "
+            kvm = v == "int8" ? 1 : v == "q4_0" ? 2 : v == "k8v4" ? 3 : v == "q8_0" ? 4 : 0;
+            if (kvm == 0 && v != "fp16") std::fprintf(stderr, "strata-q36: unknown --kv %s (fp16|int8|q4_0|k8v4|q8_0), "
                                                       "keeping the F32 pools\n", v.c_str());
         }
         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
