@@ -735,6 +735,67 @@ __global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* 
         v16[i] = __float2half(vc[(size_t) kvh * ctx * HD + rest]);
     }
 }
+/// STRATA_Q36_KV_SELFCHECK=1 only: what the quantized KV readers actually return, against the F32 truth the
+/// same `k_attn_prep` wrote for the same inputs with `kvm` 0.  A quantization error is a few tenths of a
+/// percent everywhere; a layout error is huge at fixed positions inside the 32-value block (or at fixed
+/// cells), so the two profiles are distinguishable at a glance.  Reports the worst error per `d % 32` and
+/// per block, which says WHERE before it says why.
+__global__ void k_kv_check(const uint8_t* kc, const uint8_t* vc, const float* kref, const float* vref,
+                           float* out, int HD, int HKV, int ctx, int ncell, int kvm) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = (int64_t) HKV * ncell * HD;
+    if (i >= total) return;
+    const int64_t per = (int64_t) ncell * HD;
+    const int kvh = (int)(i / per), rest = (int)(i % per);
+    const int cell = rest / HD, d = rest % HD;
+    const size_t c = (size_t) kvh * ctx + cell;
+    float kget, vget;
+    const int kmode = (kvm == 3) ? 1 : kvm, vmode = (kvm == 3) ? 2 : kvm;   // k8v4 = INT8 K + Q4_0 V
+    {   // K, read the way the engine's own readers read it
+        if (kmode == 4) {   // q8_0: 32 codes + one fp16 scale, packed 34 B per block
+            const KvBlkQ8* b = (const KvBlkQ8*) (kc + c * (size_t) (HD / 32) * 34) + (d >> 5);
+            kget = (float) b->qs[d & 31] * kv_f32_bits(b->d);
+        } else if (kmode == 1) {   // int8 codes in one plane, fp16 scales per 64 values in the other
+            const int8_t* p = (const int8_t*) kc;
+            const uint16_t* s = (const uint16_t*) (p + (size_t) HKV * ctx * HD);
+            kget = (float) p[c * HD + d] * kv_f32_bits(s[c * (HD / 64) + (d >> 6)]);
+        } else if (kmode == 2) {   // q4_0: 16 packed nibbles + one fp16 scale, 18 B per block
+            const KvBlkQ4* b = (const KvBlkQ4*) (kc + c * (size_t) (HD / 32) * 18) + (d >> 5);
+            const int r = d & 31;
+            const uint8_t by = b->qs[r < 16 ? r : r - 16];
+            kget = (float) ((r < 16 ? (by & 0xF) : (by >> 4)) - 8) * kv_f32_bits(b->d);
+        } else {
+            kget = ((const float*) kc)[c * HD + d];
+        }
+    }
+    {   // V, its own plane, the same rules
+        if (vmode == 4) {
+            const KvBlkQ8* b = (const KvBlkQ8*) (vc + c * (size_t) (HD / 32) * 34) + (d >> 5);
+            vget = (float) b->qs[d & 31] * kv_f32_bits(b->d);
+        } else if (vmode == 1) {
+            const int8_t* p = (const int8_t*) vc;
+            const uint16_t* s = (const uint16_t*) (p + (size_t) HKV * ctx * HD);
+            vget = (float) p[c * HD + d] * kv_f32_bits(s[c * (HD / 64) + (d >> 6)]);
+        } else if (vmode == 2) {
+            const KvBlkQ4* b = (const KvBlkQ4*) (vc + c * (size_t) (HD / 32) * 18) + (d >> 5);
+            const int r = d & 31;
+            const uint8_t by = b->qs[r < 16 ? r : r - 16];
+            vget = (float) ((r < 16 ? (by & 0xF) : (by >> 4)) - 8) * kv_f32_bits(b->d);
+        } else {
+            vget = ((const float*) vc)[c * HD + d];
+        }
+    }
+    const float kr = kref[(size_t) kvh * ncell * HD + rest], vr = vref[(size_t) kvh * ncell * HD + rest];
+    const float ek = fabsf(kget - kr), ev = fabsf(vget - vr);
+    const float e = fmaxf(ek, ev);
+    atomicMax((int*) &out[0], __float_as_int(e));                       // [0] worst abs error
+    atomicMax((int*) &out[1], __float_as_int(fabsf(kr)));                // [1] worst |K| seen
+    atomicMax((int*) &out[2], __float_as_int(fabsf(vr)));                // [2] worst |V| seen
+    atomicMax((int*) &out[4 + (d & 31)], __float_as_int(ek));            // [4 .. 35]  K by d % 32
+    atomicMax((int*) &out[36 + (d & 31)], __float_as_int(ev));           // [36 .. 67] V by d % 32
+    atomicMax((int*) &out[68 + (d >> 5)], __float_as_int(e));            // [68 .. ] by 32-value block
+}
+
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
 __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int P, int pos0, float scale) {
@@ -2447,6 +2508,35 @@ struct Engine {
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
                                                               rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
                                                               m->rope_base, m->eps, d_delta, mtab_now, rs, kvm);
+            static const bool kvchk = std::getenv("STRATA_Q36_KV_SELFCHECK") != nullptr;
+            static bool kvchk_done = false;
+            if (kvchk && !kvchk_done && !rows_mode && T <= 2048) {   // once, on the first chunk, layer by layer
+                kvchk_done = true;
+                const int NC = T;
+                float* kref = (float*) dalloc_t<uint8_t>((size_t) HKV * NC * HD * 4);
+                float* vref = (float*) dalloc_t<uint8_t>((size_t) HKV * NC * HD * 4);
+                float* cout = (float*) dalloc_t<uint8_t>(132 * 4);
+                CK(cudaMemsetAsync(cout, 0, 132 * 4, st));
+                // the same inputs through the same kernel, stored as F32: that IS what the quantizer was asked to keep
+                k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, kref, vref,
+                                                                  H, HKV, HD, m->n_rot, dpos, NC, m->rope_base, m->eps,
+                                                                  d_delta, mtab_now, RowSel{}, 0);
+                k_kv_check<<<grid1((int64_t) HKV * NC * HD), kThreads, 0, st>>>(
+                    (const uint8_t*) kc[li], (const uint8_t*) vc[li], kref, vref, cout, HD, HKV, ctx, NC, kvm);
+                float hv[132];
+                CK(cudaMemcpyAsync(hv, cout, 132 * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                std::fprintf(stderr, "strata-q36: KV selfcheck layer %d kvm=%d cells=%d HD=%d: worst |err|=%.5g"
+                             "  (worst |K|=%.4g  |V|=%.4g)\n", li, kvm, NC, HD, hv[0], hv[1], hv[2]);
+                std::fprintf(stderr, "strata-q36:   K by dim%%32:");
+                for (int j = 0; j < 32; ++j) std::fprintf(stderr, " %.3g", hv[4 + j]);
+                std::fprintf(stderr, "\nstrata-q36:   V by dim%%32:");
+                for (int j = 0; j < 32; ++j) std::fprintf(stderr, " %.3g", hv[36 + j]);
+                std::fprintf(stderr, "\nstrata-q36:   by block :");
+                for (int j = 0; j < HD / 32; ++j) std::fprintf(stderr, " %.3g", hv[68 + j]);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
