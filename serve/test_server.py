@@ -1163,6 +1163,28 @@ class ToolCallRecovery(unittest.TestCase):
         text = "<tool_call>\n<parameter=path>\na.md\n</parameter>\n</function>\n</tool_call>"
         self.check(text, [], text)
 
+    def test_the_wrapper_written_without_its_call_suffix(self):
+        # field case (2026-10-23, Qwen3.8 under an agent app): the wrapper lost its "_call" and the
+        # tool's name sits in a name= attribute.  With one tool declared that shortened wrapper can only be
+        # this call's, so it is read as one - streamed one character at a time and whole alike.
+        self.check(f"OK.\n<tool> <parameter name=\"write\">\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "OK.")
+
+    def test_the_shortened_wrapper_is_not_guessed_with_two_tools(self):
+        # one declared tool is what makes the shortened wrapper attributable; with two it would be a guess,
+        # so the emission stays verbatim content.
+        from serve.frontend import OutputParser
+        text = f"<tool> <parameter name=\"write\">\n{self.PARAMS}\n</tool_call>"
+        tools = self.SCHEMA + [{"name": "glob", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}}}]
+        p = OutputParser(thinking=False, tools=tools, recover=True)
+        evs = p.feed(text) + p.finish()
+        self.assertEqual([e for e in evs if e.kind == "tool_call"], [])
+        self.assertEqual("".join(e.text for e in evs if e.kind == "content"), text)
+
+    def test_the_shortened_wrapper_in_a_code_fence_is_text(self):
+        # #1058 holds for the shortened spelling too: a quoted example is prose, not a call.
+        text = f"```\n<tool> <parameter name=\"write\">\n{self.PARAMS}\n```\nend"
+        self.check(text, [], text)
+
     def test_json_in_the_wrapper(self):
         # corpus 5e847539 (x6): the JSON form inside the XML wrapper
         for key in ("arguments", "parameters"):

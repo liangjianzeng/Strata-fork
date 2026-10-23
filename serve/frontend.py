@@ -682,6 +682,13 @@ CALL_END = "</tool_call>"
 PARAM_END = "</parameter>"
 FUNC_START = "<function="
 FUNC_END = "</function>"
+FUNC_RE = re.compile(r"<function\s*=")   # tolerant opener: <function = NAME> with a stray space (#ornith-nvfp4)
+# recover: `
+NAME_ALIASES = ("tool_name", "name", "function")  # a <parameter=NAME> whose value is the tool name
+PARAM_ATTR_RE = re.compile(r'\s*name\s*=\s*"?([A-Za-z_][A-Za-z0-9_.-]*)')   # recover: the tool name in a name= attribute (#ornith-nvfp4)
+PARAM_OPEN_RE = re.compile(r'<parameter\s*(?:=|\s+name\s*=)')   # recover: the parameter tag with its name in an attribute
+PARAM_TAG = "<parameter"   # recover: either spelling of the parameter tag (#ornith-nvfp4)
+TOOL_OPEN = "<tool>"   # recover: the wrapper written without its _call
 
 
 def param_end(text: str, final: bool = False) -> int:
@@ -705,7 +712,7 @@ def call_end(text: str) -> int:
     the call format ends at the first `</tool_call>`, as before."""
     s = text.lstrip()
     pos = len(text) - len(s)
-    if not s.startswith("<function="):
+    if not FUNC_RE.match(s):
         return text.find(CALL_END) if not "<function=".startswith(s) else -1
     gt = text.find(">", pos)
     if gt < 0:
@@ -787,7 +794,7 @@ def function_end(text: str) -> int:
     parameters with param_end like call_end does; -1: not complete (or not in the call format)."""
     s = text.lstrip()
     pos = len(text) - len(s)
-    if not s.startswith(FUNC_START):
+    if not FUNC_RE.match(s):
         return -1
     gt = text.find(">", pos)
     if gt < 0:
@@ -844,9 +851,10 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
     body = body.strip()
-    if not body.startswith("<function=") or ">" not in body:
+    m = FUNC_RE.match(body)            # tolerate "<function = NAME>" with a stray space (#ornith-nvfp4)
+    if not m or ">" not in body:
         raise ValueError("malformed tool call: " + body[:80])
-    name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
+    name = body[m.end():body.index(">")].strip()      # capture between "<function=" (or "<function =") and ">"
     rest = body[body.index(">") + 1:]
     props = ((schema or {}).get("parameters") or {}).get("properties") or {}
     args = {}
@@ -901,6 +909,7 @@ class OutputParser:
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
+        self.open_state: bool | None = None   # recover: whether the shortened wrapper is outside code
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
@@ -916,13 +925,31 @@ class OutputParser:
     def _follower(self, after: str) -> str:
         """recover: what a `<tool_call>` followed (after whitespace) by `after` opens: "call" (`<function=`), "param"
         (a declared tool's name written as `<parameter=NAME>`), "json" (`{`), "wait" (not decided yet) or "text"."""
-        if after.startswith(FUNC_START):
+        if FUNC_RE.match(after):
             return "call"
-        if after.startswith(PARAM_START):
+        if after.startswith("<function"):           # <function (with optional spaces) still arriving: hold
+            return "wait"
+        if after.startswith(PARAM_TAG):
             gt = after.find(">")
             if gt < 0:
                 return "wait" if "\n" not in after else "text"
-            return "param" if after[len(PARAM_START):gt] in self.schemas else "text"
+            pname = after[len(PARAM_START):gt]
+            if pname not in self.schemas and pname not in NAME_ALIASES:
+                m = PARAM_ATTR_RE.match(after[len(PARAM_START):])
+                if m and m.group(1) in self.schemas:      # the tool's name written in an attribute
+                    after = PARAM_START + m.group(1) + ">" + after[gt + 1:]
+                    gt = after.find(">")
+                    pname = after[len(PARAM_START):gt]
+            if pname in self.schemas:
+                return "param"           # a tool's parameter written as the opener (rare)
+            if pname in NAME_ALIASES:    # the tool name is this parameter's value: <parameter=tool_name>NAME</parameter>
+                vend = after.find(PARAM_END, gt + 1)
+                if vend < 0:
+                    return "wait"
+                value = after[gt + 1:vend].strip()
+                return "named" if value in self.schemas else "text"
+            # a real parameter but no <function= opener: infer the only declared tool's name (#ornith-nvfp4)
+            return "text"                # a parameter tag naming no tool is prose, not a call
         if after.startswith("{"):
             return "json" if self.schemas else "text"
         if after.startswith("```") or (after and "```".startswith(after)):
@@ -941,16 +968,17 @@ class OutputParser:
     def _bare_opener(self) -> tuple[int, bool]:
         """recover: the first `<function=` in self.buf that opens a call without the wrapper (start of a line, outside
         code, a declared tool) -> (position, decided); (-1, False) for none.  A name still arriving is undecided."""
-        p = self.buf.find(FUNC_START)
-        while p >= 0:
+        m = FUNC_RE.search(self.buf)
+        while m:
+            p = m.start()
             if self._ok_at(p):
-                gt = self.buf.find(">", p)
-                name = self.buf[p + len(FUNC_START):gt if gt >= 0 else len(self.buf)]
+                gt = self.buf.find(">", m.end())
+                name = self.buf[m.end():gt if gt >= 0 else len(self.buf)].strip()
                 if gt < 0 and not any(c.isspace() for c in name):
                     return p, False
                 if gt >= 0 and name in self.schemas:
                     return p, True
-            p = self.buf.find(FUNC_START, p + 1)
+            m = FUNC_RE.search(self.buf, m.end())
         return -1, False
 
     @property
@@ -1076,11 +1104,12 @@ class OutputParser:
         while True:
             rest = self.buf[self.sp:]
             if self.ss == "name":
-                a = rest.find("<function=")
-                b = rest.find(">", a + 10) if a >= 0 else -1
+                m = FUNC_RE.search(rest)
+                a = m.start() if m else -1
+                b = rest.find(">", m.end()) if m else -1
                 if b < 0:
                     return out
-                name = rest[a + 10:b]
+                name = rest[m.end():b].strip()
                 self.scall = ToolCall(name=name, arguments={})
                 props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
                 self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
@@ -1191,6 +1220,20 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.recover and len(self.schemas) == 1 and self.state == "content":
+                # one tool declared, so the shortened wrapper can only be this call's; rewriting it here
+                # lets the normal wrapper path decide, with nothing of the call streamed yet.  What comes
+                # before the tag is fixed once the tag has arrived, so the code state is decided once.
+                t = self.buf.find(TOOL_OPEN)
+                if t >= 0:
+                    if self.open_state is None:
+                        snap = (self.fence, self.line, self.ticks)
+                        self._track(self.buf[:t])
+                        self.open_state = not self._in_code()   # #1058: inside code it is a quoted example
+                        self.fence, self.line, self.ticks = snap
+                    if self.open_state:
+                        self.buf = self.buf[:t] + CALL_START + self.buf[t + len(TOOL_OPEN):]
+
             if self.state == "rcall":
                 # #804: a `<tool_call>` inside the reasoning, with tools declared.  It is held whole (never streamed
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
@@ -1301,7 +1344,9 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START,))
+                    held = ((CALL_START,) if not (self.recover and len(self.schemas) == 1)
+                            else (CALL_START, TOOL_OPEN))
+                    j = len(self.buf) - self._hold(self.buf, held)
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
@@ -1327,24 +1372,41 @@ class OutputParser:
                 # it is prose that names the format ("I'll use a <tool_call> block") - content, not a malformed call
                 # that ends the request.  Until its follower has arrived it is held, like a partial tag.
                 after = self.buf[i + len(CALL_START):].lstrip()
+                at = len(self.buf) - len(after) - i - len(CALL_START)   # measured before any rewrite
+                if self.recover and not after.startswith(PARAM_START) and PARAM_OPEN_RE.match(after):
+                    m = PARAM_ATTR_RE.match(after[len("<parameter"):])
+                    gt = after.find(">")
+                    if m and gt >= 0 and m.group(1) in self.schemas:   # only once the tag has closed
+                        after = PARAM_START + m.group(1) + ">" + after[gt + 1:]
                 kind = self._follower(after) if self.recover else None
-                if kind in ("param", "json"):
+                if kind == "json":
+                    if i and self.buf[:i].strip():
+                        out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
+                    self.buf = self.buf[i + len(CALL_START):]
+                    self.state = "json"
+                    continue
+                if kind in ("param", "named", "named_one"):
                     if i and self.buf[:i].strip():
                         out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                     rest = self.buf[i + len(CALL_START):]
-                    if kind == "param":                  # <parameter=NAME> as the opener: the call's <function=NAME>
-                        at = len(rest) - len(after)
+                    if kind == "param":                  # a parameter tag written as the opener
                         rest = rest[:at] + FUNC_START + after[len(PARAM_START):]
-                    self.buf = rest
-                    self.state = "call" if kind == "param" else "json"
+                    elif kind == "named":                # the tool name carried as a parameter value
+                        gt = after.find(">"); vend = after.find(PARAM_END, gt + 1)
+                        opener = FUNC_START + after[gt + 1:vend].strip() + ">\n"
+                        after = after[vend + len(PARAM_END):]   # drop the alias parameter block
+                    else:                                # named_one: exactly one tool declared, infer its name
+                        opener = FUNC_START + next(iter(self.schemas)) + ">\n"
+                    self.buf = rest if kind == "param" else rest[:at] + opener + after
+                    self.state = "call"
                     continue
                 if kind == "wait":
                     after = ""
-                if after and not after.startswith(FUNC_START) and not FUNC_START.startswith(after):
+                if after and not FUNC_RE.match(after) and not FUNC_START.startswith(after):
                     out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                     self.buf = self.buf[i + len(CALL_START):]
                     continue
-                if not after.startswith(FUNC_START):
+                if not FUNC_RE.match(after):
                     j = i
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
