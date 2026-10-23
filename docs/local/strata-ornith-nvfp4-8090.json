@@ -15,14 +15,14 @@
     "auto",
     "--mtp",
     "2",
-    "--vision",
-    "--expert-pool",
-    "D:/MyLLM/models/experts-q36.bin"
+    "--vision"
   ],
   "tokenizer": "D:/MyLLM/models/ornith-nvfp4",
   "model_name": "Ornith-1.5-35B-NVFP4",
+  "tool_call_recovery": true,
   "host": "0.0.0.0",
   "api_key": "sk-llama-d5c7afa0e6f1a9f423364ee5b87e9c28e960342c6ba0d979a5d0b620079fae50",
+  "log": "D:/MyLLM/strata-8090.log",
   "vision": {
     "exe": "D:/MyLLM/strata-run/strata-vision.exe",
     "mmproj": "D:/MyLLM/models/mmproj-Ornith-1.5-35B-BF16.gguf",
